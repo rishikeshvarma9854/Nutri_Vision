@@ -3,7 +3,7 @@ import { doc, setDoc, collection, addDoc, serverTimestamp } from 'firebase/fires
 import { GoogleGenerativeAI } from '@google/generative-ai';
 
 // Get API key from environment variables
-const API_KEY = "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"; // Using the key directly for now
+const API_KEY = import.meta.env.VITE_HUGGING_FACE_API_KEY;
 const API_URL = "https://api-inference.huggingface.co/models/gpt2";
 
 // Add API key validation
