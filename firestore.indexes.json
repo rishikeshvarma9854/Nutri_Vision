@@ -15,6 +15,20 @@
       ]
     },
     {
+      "collectionGroup": "dietPlans",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "userId",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "createdAt",
+          "order": "DESCENDING"
+        }
+      ]
+    },
+    {
       "collectionGroup": "mealLogs",
       "queryScope": "COLLECTION",
       "fields": [

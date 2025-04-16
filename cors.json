@@ -1,8 +1,31 @@
 [
   {
-    "origin": ["http://localhost:3000", "https://nutri-vision-d6596.web.app"],
-    "method": ["GET", "POST", "PUT", "DELETE", "HEAD"],
+    "origin": [
+      "http://localhost:3000",
+      "https://nutri-vision-704d5.web.app",
+      "https://nutri-vision-704d5.firebaseapp.com"
+    ],
+    "method": ["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD"],
     "maxAgeSeconds": 3600,
-    "responseHeader": ["Content-Type", "Authorization", "Content-Length", "User-Agent", "x-goog-*"]
+    "responseHeader": [
+      "Content-Type",
+      "Authorization",
+      "Content-Length",
+      "User-Agent",
+      "x-goog-resumable",
+      "x-goog-meta-*",
+      "x-goog-content-length-range",
+      "x-goog-content-type",
+      "x-goog-encryption-algorithm",
+      "x-goog-encryption-key",
+      "x-goog-encryption-key-sha256",
+      "x-goog-storage-class",
+      "x-goog-meta-foo",
+      "x-goog-meta-bar",
+      "Access-Control-Allow-Origin",
+      "Access-Control-Allow-Methods",
+      "Access-Control-Allow-Headers",
+      "Access-Control-Max-Age"
+    ]
   }
 ] 

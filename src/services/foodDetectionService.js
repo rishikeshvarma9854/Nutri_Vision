@@ -1,6 +1,6 @@
-// Food detection service using PyTorch model
-const API_ENDPOINT = 'http://localhost:5000/detect'; // Assuming Flask server runs on port 5000
+import { API_ENDPOINTS, API_CONFIG, handleServerError } from '../config/api';
 
+// Food detection service using PyTorch model
 export const detectFoodAndNutrition = async (imageUrl) => {
   try {
     // Convert image URL to File/Blob if it's not already
@@ -11,10 +11,13 @@ export const detectFoodAndNutrition = async (imageUrl) => {
     const formData = new FormData();
     formData.append('image', imageBlob, 'food_image.jpg');
 
-    // Send to Flask backend
-    const response = await fetch(API_ENDPOINT, {
+    // Send to Flask backend through proxy
+    const response = await fetch(API_ENDPOINTS.DETECT, {
       method: 'POST',
-      body: formData
+      body: formData,
+      headers: {
+        'Accept': 'application/json'
+      }
     });
 
     if (!response.ok) {
@@ -31,13 +34,7 @@ export const detectFoodAndNutrition = async (imageUrl) => {
     console.error('Error in food detection:', error);
     return {
       success: false,
-      error: error.message,
-      nutrition: {
-        calories: 0,
-        protein: 0,
-        carbs: 0,
-        fats: 0
-      }
+      ...handleServerError(error)
     };
   }
 }; 

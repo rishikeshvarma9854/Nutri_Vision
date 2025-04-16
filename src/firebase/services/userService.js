@@ -1,9 +1,7 @@
-import { db } from '../config';
+import { db, optimizedWrite } from '../config';
 import { 
   doc, 
-  setDoc, 
   getDoc, 
-  updateDoc, 
   serverTimestamp 
 } from 'firebase/firestore';
 
@@ -11,7 +9,7 @@ import {
 export const createUser = async (userId, userData) => {
   try {
     const userRef = doc(db, 'users', userId);
-    await setDoc(userRef, {
+    await optimizedWrite(userRef, {
       user_id: userId,
       name: userData.name || '',
       email: userData.email || '',
@@ -30,7 +28,7 @@ export const createUser = async (userId, userData) => {
 export const createUserProfile = async (userId, profileData) => {
   try {
     const profileRef = doc(db, 'userProfiles', userId);
-    await setDoc(profileRef, {
+    await optimizedWrite(profileRef, {
       user_id: userId,
       height: profileData.height || 0,
       weight: profileData.weight || 0,
@@ -40,8 +38,6 @@ export const createUserProfile = async (userId, profileData) => {
       dietary_type: profileData.dietaryType || '',
       food_allergies: profileData.foodAllergies || [],
       medical_conditions: profileData.medicalConditions || [],
-      water_intake: profileData.waterIntake || 0,
-      sleep_time: profileData.sleepTime || '',
       updated_at: serverTimestamp()
     });
   } catch (error) {
@@ -78,7 +74,7 @@ export const getUserProfile = async (userId) => {
 export const updateUserProfile = async (userId, profileData) => {
   try {
     const profileRef = doc(db, 'userProfiles', userId);
-    await updateDoc(profileRef, {
+    await optimizedWrite(profileRef, {
       ...profileData,
       updated_at: serverTimestamp()
     });
@@ -92,7 +88,7 @@ export const updateUserProfile = async (userId, profileData) => {
 export const updateUserLastLogin = async (userId) => {
   try {
     const userRef = doc(db, 'users', userId);
-    await updateDoc(userRef, {
+    await optimizedWrite(userRef, {
       last_login: serverTimestamp()
     });
   } catch (error) {

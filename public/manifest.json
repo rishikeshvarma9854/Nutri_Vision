@@ -1,0 +1,16 @@
+{
+  "short_name": "Nutri Vision",
+  "name": "Nutri Vision - AI Nutrition Tracking",
+  "icons": [
+    {
+      "src": "logo192.png",
+      "type": "image/png",
+      "sizes": "192x192",
+      "purpose": "any"
+    }
+  ],
+  "start_url": ".",
+  "display": "standalone",
+  "theme_color": "#4CAF50",
+  "background_color": "#ffffff"
+} 

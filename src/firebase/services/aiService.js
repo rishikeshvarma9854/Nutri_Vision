@@ -1,20 +1,24 @@
-import { db } from '../config';
+import { db } from '../config.js';
 import { doc, setDoc, collection, addDoc, serverTimestamp } from 'firebase/firestore';
+import { GoogleGenerativeAI } from '@google/generative-ai';
 
-const API_KEY = import.meta.env.VITE_HUGGING_FACE_API_KEY;
+// Get API key from environment variables
+const API_KEY = "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"; // Using the key directly for now
 const API_URL = "https://api-inference.huggingface.co/models/gpt2";
 
 // Add API key validation
 console.log('API Key configured:', API_KEY ? 'Yes' : 'No');
 if (!API_KEY) {
-  console.warn('Hugging Face API key is not configured. Please set VITE_HUGGING_FACE_API_KEY in your environment variables.');
+  console.warn('Hugging Face API key is not configured.');
 }
+
+const genAI = new GoogleGenerativeAI(import.meta.env.VITE_GEMINI_API_KEY);
 
 // Generate content using Hugging Face API
 const generateContent = async (prompt) => {
   try {
     if (!API_KEY) {
-      throw new Error('API key is not configured. Please set VITE_HUGGING_FACE_API_KEY in your environment variables.');
+      throw new Error('API key is not configured. Please set REACT_APP_HUGGING_FACE_API_KEY in your environment variables.');
     }
 
     console.log('Making API request to Hugging Face...');
@@ -151,224 +155,52 @@ const storeAIInteraction = async (userId, type, prompt, response) => {
 };
 
 // Generate diet recommendations
-export const generateDietRecommendations = async (userProfile) => {
+export const generateDietRecommendations = async (userProfile, dietPlan) => {
   try {
-    console.log('Generating diet recommendations for profile:', userProfile);
+    const model = genAI.getGenerativeModel({ model: "gemini-pro" });
+
+    const prompt = `Generate personalized food recommendations based on the following user profile and diet plan:
+
+User Profile:
+- Age: ${userProfile.age}
+- Gender: ${userProfile.gender}
+- Weight: ${userProfile.weight} kg
+- Height: ${userProfile.height} cm
+- Activity Level: ${userProfile.activityLevel}
+- Dietary Preferences: ${userProfile.dietaryPreferences?.join(', ') || 'None specified'}
+
+Diet Plan:
+- Daily Calories: ${dietPlan.recommendations.dailyTargets.total.calories} kcal
+- Protein: ${dietPlan.recommendations.dailyTargets.total.protein}g
+- Carbs: ${dietPlan.recommendations.dailyTargets.total.carbs}g
+- Fats: ${dietPlan.recommendations.dailyTargets.total.fats}g
+
+Please provide:
+1. A list of recommended foods that align with the user's profile and nutritional needs
+2. A list of foods to avoid based on the user's profile and goals
+
+Format the response as a JSON object with two properties:
+- recommendedFoods: A markdown-formatted list of recommended foods
+- foodsToAvoid: A markdown-formatted list of foods to avoid`;
+
+    const result = await model.generateContent(prompt);
+    const response = await result.response;
+    const text = response.text();
     
-    // Create a detailed prompt for the AI
-    const prompt = `Generate a personalized diet plan for:
-Age: ${userProfile.age} years
-Height: ${userProfile.height}cm
-Weight: ${userProfile.weight}kg
-Target Weight: ${userProfile.targetWeight}kg
-Goal: ${userProfile.goal}
-Activity Level: ${userProfile.activityLevel}
-Dietary Type: ${userProfile.dietaryType}
-Food Allergies: ${userProfile.foodAllergies?.join(', ') || 'None'}
-Medical Conditions: ${userProfile.medicalConditions?.join(', ') || 'None'}
-
-Please provide specific recommendations considering their medical conditions and goals.`;
-
-    try {
-      // For now, let's use an enhanced static recommendation system
-      // that takes into account the user's profile
-      const isWeightGain = userProfile.goal?.toLowerCase().includes('gain');
-      const isWeightLoss = userProfile.goal?.toLowerCase().includes('loss');
-      const isVegetarian = userProfile.dietaryType?.toLowerCase().includes('vegetarian');
-      const isVegan = userProfile.dietaryType?.toLowerCase().includes('vegan');
-      const hasDiabetes = userProfile.medicalConditions?.some(c => c.toLowerCase().includes('diabetes'));
-      const hasHeartCondition = userProfile.medicalConditions?.some(c => c.toLowerCase().includes('heart'));
-
-      const recommendations = {
-        recommendedFoods: [
-          ...(isVegan ? [
-            'Quinoa',
-            'Lentils',
-            'Chickpeas',
-            'Tofu',
-            'Tempeh',
-            'Seitan',
-            'Nutritional yeast',
-            'Plant-based protein powder',
-            'Chia seeds',
-            'Hemp seeds'
-          ] : isVegetarian ? [
-            'Greek yogurt',
-            'Eggs',
-            'Cottage cheese',
-            'Whey protein',
-            'Lentils',
-            'Quinoa',
-            'Tofu',
-            'Tempeh'
-          ] : [
-            'Chicken breast',
-            'Salmon',
-            'Lean beef',
-            'Turkey',
-            'Eggs',
-            'Greek yogurt',
-            'Tuna',
-            'Whey protein'
-          ]),
-          'Sweet potatoes',
-          'Brown rice',
-          'Oatmeal',
-          'Spinach',
-          'Broccoli',
-          'Avocado',
-          'Almonds',
-          'Olive oil',
-          'Bananas',
-          'Berries',
-          ...(hasDiabetes ? [
-            'Cinnamon',
-            'Green leafy vegetables',
-            'Chia seeds',
-            'Steel-cut oats'
-          ] : []),
-          ...(hasHeartCondition ? [
-            'Fatty fish',
-            'Walnuts',
-            'Flaxseeds',
-            'Garlic',
-            'Dark leafy greens'
-          ] : [])
-        ],
-        foodsToAvoid: [
-          'Processed foods',
-          'Artificial sweeteners',
-          'Excessive caffeine',
-          'Deep fried foods',
-          ...(userProfile.foodAllergies || []),
-          ...(isVegan ? ['All animal products'] :
-              isVegetarian ? ['Meat products'] : []),
-          ...(hasDiabetes ? [
-            'Sugary drinks',
-            'White bread',
-            'Processed snacks',
-            'Candy',
-            'Regular soda'
-          ] : []),
-          ...(hasHeartCondition ? [
-            'Saturated fats',
-            'Trans fats',
-            'Excessive salt',
-            'Processed meats'
-          ] : [])
-        ],
-        mealSchedule: [
-          {
-            name: 'Breakfast',
-            time: '7:00 AM - 9:00 AM',
-            foods: isVegan ? [
-              'Oatmeal with plant-based milk and berries',
-              'Banana and almond butter smoothie',
-              'Chia seeds',
-              ...(hasDiabetes ? ['Cinnamon for blood sugar control'] : [])
-            ] : isVegetarian ? [
-              'Greek yogurt with honey and granola',
-              'Scrambled eggs with spinach',
-              'Whole grain toast'
-            ] : [
-              'Scrambled eggs with vegetables',
-              'Oatmeal with protein powder',
-              'Fresh fruit'
-            ],
-            targets: {
-              calories: isWeightGain ? 600 : isWeightLoss ? 300 : 400,
-              protein: isWeightGain ? 35 : 25,
-              carbs: isWeightGain ? 70 : isWeightLoss ? 30 : 45,
-              fats: isWeightGain ? 20 : 15
-            }
-          },
-          {
-            name: 'Lunch',
-            time: '12:00 PM - 2:00 PM',
-            foods: isVegan ? [
-              'Quinoa bowl with roasted vegetables',
-              'Chickpea curry',
-              'Mixed green salad'
-            ] : isVegetarian ? [
-              'Lentil soup with vegetables',
-              'Quinoa salad with tofu',
-              'Mixed nuts'
-            ] : [
-              'Grilled chicken breast',
-              'Brown rice',
-              'Steamed vegetables'
-            ],
-            targets: {
-              calories: isWeightGain ? 700 : isWeightLoss ? 400 : 500,
-              protein: isWeightGain ? 40 : 30,
-              carbs: isWeightGain ? 80 : isWeightLoss ? 35 : 50,
-              fats: isWeightGain ? 25 : 20
-            }
-          },
-          {
-            name: 'Dinner',
-            time: '6:00 PM - 8:00 PM',
-            foods: isVegan ? [
-              'Tempeh stir-fry with vegetables',
-              'Brown rice',
-              'Steamed broccoli'
-            ] : isVegetarian ? [
-              'Black bean burger',
-              'Sweet potato wedges',
-              'Grilled vegetables'
-            ] : [
-              'Baked salmon',
-              'Quinoa',
-              'Roasted vegetables'
-            ],
-            targets: {
-              calories: isWeightGain ? 600 : isWeightLoss ? 350 : 450,
-              protein: isWeightGain ? 35 : 28,
-              carbs: isWeightGain ? 65 : isWeightLoss ? 35 : 45,
-              fats: isWeightGain ? 22 : 18
-            }
-          },
-          {
-            name: 'Snacks',
-            time: '10:00 AM, 3:00 PM',
-            foods: isVegan ? [
-              'Mixed nuts and dried fruit',
-              'Apple with almond butter',
-              'Hummus with vegetable sticks'
-            ] : isVegetarian ? [
-              'Greek yogurt with honey',
-              'Trail mix',
-              'Protein smoothie'
-            ] : [
-              'Protein shake',
-              'Almonds and fruit',
-              'Rice cakes with peanut butter'
-            ],
-            targets: {
-              calories: isWeightGain ? 200 : isWeightLoss ? 100 : 150,
-              protein: isWeightGain ? 15 : 8,
-              carbs: isWeightGain ? 25 : isWeightLoss ? 10 : 15,
-              fats: isWeightGain ? 10 : 7
-            }
-          }
-        ],
-        additionalNotes: `This meal plan is customized for your ${userProfile.goal} goal with a ${userProfile.dietaryType} diet.
-${hasDiabetes ? '\n• For diabetes management: Focus on low glycemic index foods, regular meal timing, and portion control.' : ''}
-${hasHeartCondition ? '\n• For heart health: Emphasis on omega-3 rich foods, reduced sodium, and heart-healthy fats.' : ''}
-${userProfile.foodAllergies?.length ? '\n• Carefully check food labels due to your allergies.' : ''}
-\nAdjust portions based on your hunger and energy levels. Stay hydrated by drinking water throughout the day.
-${isVegan ? '\nConsider taking supplements (B12, D3, Iron)' : isVegetarian ? '\nConsider taking supplements (B12, D3)' : ''}
-Monitor your progress and adjust the plan as needed.`
-      };
-
-      return recommendations;
-    } catch (error) {
-      console.error('Error generating AI recommendations:', error);
-      throw error;
-    }
+    // Parse the JSON response
+    const recommendations = JSON.parse(text);
+    
+    return {
+      recommendedFoods: recommendations.recommendedFoods,
+      foodsToAvoid: recommendations.foodsToAvoid
+    };
   } catch (error) {
-    console.error('Error in diet recommendations:', error);
-    throw error;
+    console.error('Error generating food recommendations:', error);
+    // Return default recommendations if Gemini fails
+    return {
+      recommendedFoods: "Based on your profile, focus on whole foods, lean proteins, and complex carbohydrates.",
+      foodsToAvoid: "Limit processed foods, sugary drinks, and excessive saturated fats."
+    };
   }
 };
 

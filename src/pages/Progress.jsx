@@ -9,7 +9,8 @@ import {
   ToggleButton,
   ToggleButtonGroup,
   CircularProgress,
-  Alert
+  Alert,
+  Paper
 } from '@mui/material';
 import { Line } from 'react-chartjs-2';
 import {
@@ -21,10 +22,12 @@ import {
   Title,
   Tooltip,
   Legend,
-  Filler
+  Filler,
+  BarElement
 } from 'chart.js';
 import { db, auth } from '../firebase/config';
 import { collection, query, where, getDocs, orderBy, limit, doc, getDoc } from 'firebase/firestore';
+import MealAnalysis from '../components/MealAnalysis';
 
 // Register ChartJS components
 ChartJS.register(
@@ -32,6 +35,7 @@ ChartJS.register(
   LinearScale,
   PointElement,
   LineElement,
+  BarElement,
   Title,
   Tooltip,
   Legend,
@@ -47,9 +51,9 @@ const Progress = () => {
     protein: [],
     carbs: [],
     fats: [],
-    weight: [],
     streak: [],
-    dates: []
+    dates: [],
+    mealBreakdown: {}
   });
 
   useEffect(() => {
@@ -80,35 +84,44 @@ const Progress = () => {
       const userMealsRef = doc(db, 'userMeals', userId);
       const userMealsDoc = await getDoc(userMealsRef);
       
-      // Process meal data into daily totals
+      // Process meal data into daily totals and meal-specific breakdowns
       const dailyTotals = {};
+      const mealBreakdown = {};
+      
       if (userMealsDoc.exists()) {
         const mealsData = userMealsDoc.data();
-        Object.entries(mealsData).forEach(([date, meals]) => {
+        Object.entries(mealsData).forEach(([date, dayData]) => {
           const mealDate = new Date(date);
           if (mealDate >= startDate && mealDate <= endDate) {
-            dailyTotals[date] = meals.reduce((total, meal) => ({
-              calories: total.calories + (meal.nutritionInfo?.calories || 0),
-              protein: total.protein + (meal.nutritionInfo?.protein || 0),
-              carbs: total.carbs + (meal.nutritionInfo?.carbs || 0),
-              fats: total.fats + (meal.nutritionInfo?.fats || 0)
-            }), { calories: 0, protein: 0, carbs: 0, fats: 0 });
-          }
-        });
-      }
-
-      // Fetch user progress for weight data
-      const userProgressRef = doc(db, 'userProgress', userId);
-      const userProgressDoc = await getDoc(userProgressRef);
-      const weightData = {};
-      if (userProgressDoc.exists()) {
-        const progressData = userProgressDoc.data();
-        Object.entries(progressData).forEach(([date, data]) => {
-          if (data.weight) {
-            const progressDate = new Date(date);
-            if (progressDate >= startDate && progressDate <= endDate) {
-              weightData[date] = data.weight;
-            }
+            // Initialize daily totals
+            dailyTotals[date] = {
+              calories: 0,
+              protein: 0,
+              carbs: 0,
+              fats: 0
+            };
+            
+            // Process each meal type
+            Object.entries(dayData).forEach(([mealType, mealData]) => {
+              if (!mealBreakdown[date]) {
+                mealBreakdown[date] = {};
+              }
+              
+              // Store meal-specific data
+              mealBreakdown[date][mealType] = {
+                calories: mealData.nutrition?.calories || 0,
+                protein: mealData.nutrition?.protein || 0,
+                carbs: mealData.nutrition?.carbs || 0,
+                fats: mealData.nutrition?.fats || 0,
+                timestamp: mealData.timestamp
+              };
+              
+              // Add to daily totals
+              dailyTotals[date].calories += mealData.nutrition?.calories || 0;
+              dailyTotals[date].protein += mealData.nutrition?.protein || 0;
+              dailyTotals[date].carbs += mealData.nutrition?.carbs || 0;
+              dailyTotals[date].fats += mealData.nutrition?.fats || 0;
+            });
           }
         });
       }
@@ -117,20 +130,34 @@ const Progress = () => {
       const userStreaksRef = doc(db, 'userStreaks', userId);
       const userStreaksDoc = await getDoc(userStreaksRef);
       const streakData = {};
+      
       if (userStreaksDoc.exists()) {
         const streaksData = userStreaksDoc.data();
-        Object.entries(streaksData).forEach(([date, data]) => {
-          const streakDate = new Date(date);
-          if (streakDate >= startDate && streakDate <= endDate) {
-            streakData[date] = data.streak || 0;
+        const history = streaksData.history || {};
+        
+        // Get all dates in the range
+        const allDates = [];
+        let currentDate = new Date(startDate);
+        while (currentDate <= endDate) {
+          allDates.push(currentDate.toISOString().split('T')[0]);
+          currentDate.setDate(currentDate.getDate() + 1);
+        }
+
+        // Calculate streak for each date
+        let currentStreak = 0;
+        for (const date of allDates) {
+          if (history[date]) {
+            currentStreak++;
+          } else {
+            currentStreak = 0;
           }
-        });
+          streakData[date] = currentStreak;
+        }
       }
 
       // Combine all data
       const dates = [...new Set([
         ...Object.keys(dailyTotals),
-        ...Object.keys(weightData),
         ...Object.keys(streakData)
       ])].sort();
 
@@ -139,12 +166,12 @@ const Progress = () => {
         protein: dates.map(date => dailyTotals[date]?.protein || 0),
         carbs: dates.map(date => dailyTotals[date]?.carbs || 0),
         fats: dates.map(date => dailyTotals[date]?.fats || 0),
-        weight: dates.map(date => weightData[date] || null),
         streak: dates.map(date => streakData[date] || 0),
         dates: dates.map(date => {
           const d = new Date(date);
           return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
-        })
+        }),
+        mealBreakdown
       };
 
       setProgressData(processedData);
@@ -158,16 +185,75 @@ const Progress = () => {
 
   const chartOptions = {
     responsive: true,
+    maintainAspectRatio: false,
     plugins: {
       legend: {
         position: 'top',
       },
+      tooltip: {
+        mode: 'index',
+        intersect: false,
+      }
     },
     scales: {
+      x: {
+        grid: {
+          display: false
+        },
+        ticks: {
+          maxRotation: 45,
+          minRotation: 45
+        }
+      },
       y: {
         beginAtZero: true,
-      },
+        ticks: {
+          stepSize: 100,
+          callback: function(value) {
+            return value.toFixed(0);
+          }
+        }
+      }
     },
+    interaction: {
+      mode: 'nearest',
+      axis: 'x',
+      intersect: false
+    }
+  };
+
+  // Specific options for weight chart
+  const weightChartOptions = {
+    ...chartOptions,
+    scales: {
+      ...chartOptions.scales,
+      y: {
+        beginAtZero: false,
+        ticks: {
+          stepSize: 1,
+          callback: function(value) {
+            return value.toFixed(1) + ' kg';
+          }
+        }
+      }
+    }
+  };
+
+  // Specific options for streak chart
+  const streakChartOptions = {
+    ...chartOptions,
+    scales: {
+      ...chartOptions.scales,
+      y: {
+        beginAtZero: true,
+        ticks: {
+          stepSize: 1,
+          callback: function(value) {
+            return Math.floor(value) + ' days';
+          }
+        }
+      }
+    }
   };
 
   const createChartData = (label, data, color) => ({
@@ -179,7 +265,9 @@ const Progress = () => {
         borderColor: color,
         backgroundColor: color + '20',
         fill: true,
-        tension: 0.4
+        tension: 0.4,
+        pointRadius: 4,
+        pointHoverRadius: 6
       }
     ]
   });
@@ -198,6 +286,7 @@ const Progress = () => {
         <Typography variant="h4" gutterBottom>
           Progress Tracking
         </Typography>
+        
         <ToggleButtonGroup
           value={timeRange}
           exclusive
@@ -216,112 +305,125 @@ const Progress = () => {
         )}
 
         <Grid container spacing={3}>
-          {/* Calories Progress */}
-          <Grid item xs={12} md={6}>
-            <Card>
-              <CardContent>
-                <Typography variant="h6" gutterBottom>
-                  Calories Intake
-                </Typography>
-                <Line 
-                  data={createChartData('Calories', progressData.calories, '#2196f3')} 
-                  options={chartOptions}
-                />
-              </CardContent>
-            </Card>
-          </Grid>
-
-          {/* Macronutrients Progress */}
-          <Grid item xs={12} md={6}>
-            <Card>
-              <CardContent>
-                <Typography variant="h6" gutterBottom>
-                  Macronutrients
-                </Typography>
-                <Line 
-                  data={{
-                    labels: progressData.dates,
-                    datasets: [
-                      {
-                        label: 'Protein',
-                        data: progressData.protein,
-                        borderColor: '#4caf50',
-                        backgroundColor: '#4caf5020',
-                        fill: true,
-                        tension: 0.4
-                      },
-                      {
-                        label: 'Carbs',
-                        data: progressData.carbs,
-                        borderColor: '#ff9800',
-                        backgroundColor: '#ff980020',
-                        fill: true,
-                        tension: 0.4
-                      },
-                      {
-                        label: 'Fats',
-                        data: progressData.fats,
-                        borderColor: '#f44336',
-                        backgroundColor: '#f4433620',
-                        fill: true,
-                        tension: 0.4
-                      }
-                    ]
-                  }}
-                  options={chartOptions}
-                />
-              </CardContent>
-            </Card>
-          </Grid>
-
-          {/* Weight Progress */}
-          <Grid item xs={12} md={6}>
-            <Card>
-              <CardContent>
-                <Typography variant="h6" gutterBottom>
-                  Weight Progress
-                </Typography>
-                <Line 
-                  data={createChartData('Weight (kg)', progressData.weight, '#9c27b0')}
-                  options={{
-                    ...chartOptions,
-                    plugins: {
-                      ...chartOptions.plugins,
-                      tooltip: {
-                        callbacks: {
-                          label: (context) => `Weight: ${context.parsed.y} kg`
+          {/* Nutrition Overview */}
+          <Grid item xs={12}>
+            <Paper elevation={2} sx={{ p: 3 }}>
+              <Typography variant="h6" gutterBottom>
+                Nutrition Overview
+              </Typography>
+              <Box sx={{ 
+                height: 400, 
+                overflowX: 'auto',
+                overflowY: 'hidden'
+              }}>
+                <Box sx={{ 
+                  minWidth: progressData.dates.length * 50,
+                  height: '100%'
+                }}>
+                  <Line
+                    options={chartOptions}
+                    data={{
+                      labels: progressData.dates,
+                      datasets: [
+                        {
+                          label: 'Calories',
+                          data: progressData.calories,
+                          borderColor: '#FF6384',
+                          backgroundColor: '#FF638420',
+                          fill: true,
+                          tension: 0.4,
+                          pointRadius: 4,
+                          pointHoverRadius: 6
+                        },
+                        {
+                          label: 'Protein',
+                          data: progressData.protein,
+                          borderColor: '#36A2EB',
+                          backgroundColor: '#36A2EB20',
+                          fill: true,
+                          tension: 0.4,
+                          pointRadius: 4,
+                          pointHoverRadius: 6
+                        },
+                        {
+                          label: 'Carbs',
+                          data: progressData.carbs,
+                          borderColor: '#4BC0C0',
+                          backgroundColor: '#4BC0C020',
+                          fill: true,
+                          tension: 0.4,
+                          pointRadius: 4,
+                          pointHoverRadius: 6
+                        },
+                        {
+                          label: 'Fats',
+                          data: progressData.fats,
+                          borderColor: '#FFCE56',
+                          backgroundColor: '#FFCE5620',
+                          fill: true,
+                          tension: 0.4,
+                          pointRadius: 4,
+                          pointHoverRadius: 6
                         }
-                      }
-                    }
-                  }}
-                />
-              </CardContent>
-            </Card>
+                      ]
+                    }}
+                  />
+                </Box>
+              </Box>
+            </Paper>
           </Grid>
 
           {/* Streak Progress */}
-          <Grid item xs={12} md={6}>
-            <Card>
-              <CardContent>
-                <Typography variant="h6" gutterBottom>
-                  Diet Adherence Streak
-                </Typography>
-                <Line 
-                  data={createChartData('Days', progressData.streak, '#795548')}
-                  options={{
-                    ...chartOptions,
-                    plugins: {
-                      ...chartOptions.plugins,
-                      tooltip: {
-                        callbacks: {
-                          label: (context) => `Streak: ${context.parsed.y} days`
+          <Grid item xs={12}>
+            <Paper elevation={2} sx={{ p: 3 }}>
+              <Typography variant="h6" gutterBottom>
+                Diet Adherence Streak
+              </Typography>
+              <Box sx={{ 
+                height: 300,
+                overflowX: 'auto',
+                overflowY: 'hidden'
+              }}>
+                <Box sx={{ 
+                  minWidth: progressData.dates.length * 50,
+                  height: '100%'
+                }}>
+                  <Line
+                    options={{
+                      ...chartOptions,
+                      scales: {
+                        ...chartOptions.scales,
+                        y: {
+                          beginAtZero: true,
+                          ticks: {
+                            stepSize: 1,
+                            callback: function(value) {
+                              return Math.floor(value) + ' days';
+                            }
+                          }
+                        }
+                      },
+                      plugins: {
+                        ...chartOptions.plugins,
+                        tooltip: {
+                          callbacks: {
+                            label: function(context) {
+                              return `Streak: ${context.parsed.y} days`;
+                            }
+                          }
                         }
                       }
-                    }
-                  }}
-                />
-              </CardContent>
-            </Card>
+                    }}
+                    data={createChartData('Daily Streak', progressData.streak, '#4BC0C0')}
+                  />
+                </Box>
+              </Box>
+            </Paper>
+          </Grid>
+
+          {/* AI Analysis */}
+          <Grid item xs={12}>
+            <MealAnalysis mealData={progressData.mealBreakdown} />
           </Grid>
         </Grid>
       </Box>

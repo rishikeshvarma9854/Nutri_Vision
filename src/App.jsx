@@ -1,5 +1,5 @@
 import React from 'react';
-import { Routes, Route, Navigate } from 'react-router-dom';
+import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
 import { ThemeProvider, Box, CircularProgress } from '@mui/material';
 import theme from './theme';
 import Navbar from './components/layout/Navbar';
@@ -88,11 +88,13 @@ const AppContent = () => {
 
 const App = () => {
   return (
-    <ThemeProvider theme={theme}>
-      <AuthProvider>
-        <AppContent />
-      </AuthProvider>
-    </ThemeProvider>
+    <BrowserRouter>
+      <ThemeProvider theme={theme}>
+        <AuthProvider>
+          <AppContent />
+        </AuthProvider>
+      </ThemeProvider>
+    </BrowserRouter>
   );
 };
 

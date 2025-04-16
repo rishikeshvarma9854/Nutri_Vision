@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect } from 'react';
+import { useState, useRef, useEffect, useCallback } from 'react';
 import {
   Box,
   Button,
@@ -13,14 +13,109 @@ import {
   Avatar,
   Alert,
 } from '@mui/material';
-import {
-  Chat as ChatIcon,
-  Close as CloseIcon,
-  Send as SendIcon,
-} from '@mui/icons-material';
+import ChatIcon from '@mui/icons-material/Chat';
+import CloseIcon from '@mui/icons-material/Close';
+import SendIcon from '@mui/icons-material/Send';
 import { auth, db } from '../../firebase/config';
-import { doc, getDoc, setDoc, collection, query, where, orderBy, limit, getDocs, addDoc, serverTimestamp } from 'firebase/firestore';
+import { doc, getDoc, setDoc, collection, query, where, orderBy, limit, getDocs, addDoc, serverTimestamp, writeBatch } from 'firebase/firestore';
 import { useAuth } from '../../contexts/AuthContext';
+import debounce from 'lodash/debounce';
+
+// Cache for user profiles and messages
+const userProfileCache = new Map();
+const messageCache = new Map();
+const WRITE_BATCH_DELAY = 300000; // 5 minutes
+const MESSAGE_BATCH_SIZE = 20;
+const CACHE_EXPIRY = 30 * 60 * 1000; // 30 minutes
+const MAX_PENDING_MESSAGES = 50;
+const WRITE_INTERVAL = 300000; // 5 minutes
+const MAX_CACHED_MESSAGES = 50;
+const MESSAGE_CACHE_KEY = 'chatMessageCache';
+let lastWriteTime = 0;
+
+const formatMessage = (text) => {
+  // Split the text into sections (paragraphs)
+  const sections = text.split('\n\n').map(section => section.trim()).filter(section => section);
+  
+  // Format each section
+  const formattedSections = sections.map(section => {
+    const lines = section.split('\n').map(line => line.trim()).filter(line => line);
+    
+    // Check if this is a bullet point list section
+    const isBulletList = lines.some(line => line.startsWith('*') || line.startsWith('•'));
+    
+    return lines.map(line => {
+      // Remove markdown stars but preserve text and formatting
+      line = line.replace(/\*\*([^*]+)\*\*/g, (_, text) => `<strong>${text}</strong>`);
+      
+      // Handle bullet points (both * and •)
+      if (line.startsWith('*') || line.startsWith('•')) {
+        return line.replace(/^[*•]\s*/, '• ');
+      }
+      
+      return line;
+    }).join('\n');
+  });
+  
+  return formattedSections.join('\n\n');
+};
+
+const MessageContent = ({ text }) => {
+  const lines = text.split('\n');
+  
+  return (
+    <>
+      {lines.map((line, i) => {
+        // Check if line contains bold text (wrapped in <strong> tags)
+        const hasBoldText = line.includes('<strong>');
+        
+        // Split line into parts if it contains bold text
+        if (hasBoldText) {
+          const parts = line.split(/(<strong>.*?<\/strong>)/g);
+          return (
+            <Typography
+              key={i}
+              variant="body2"
+              component="div"
+              className={line.trim().startsWith('•') ? 'bullet-point' : ''}
+              sx={{
+                pl: line.trim().startsWith('•') ? 2 : 0,
+                my: 0.5,
+                '& strong': {
+                  fontWeight: 'bold'
+                }
+              }}
+            >
+              {parts.map((part, j) => {
+                if (part.startsWith('<strong>')) {
+                  return <strong key={j}>{part.replace(/<\/?strong>/g, '')}</strong>;
+                }
+                return part;
+              })}
+            </Typography>
+          );
+        }
+        
+        return (
+          <Typography
+            key={i}
+            variant="body2"
+            component="div"
+            className={line.trim().startsWith('•') ? 'bullet-point' : ''}
+            sx={{
+              pl: line.trim().startsWith('•') ? 2 : 0,
+              fontWeight: line.trim().startsWith('•') ? 'normal' : 
+                        (line.length > 0 && line === line.toUpperCase()) ? 'bold' : 'normal',
+              my: 0.5
+            }}
+          >
+            {line.trim().startsWith('•') ? line.substring(1).trim() : line}
+          </Typography>
+        );
+      })}
+    </>
+  );
+};
 
 const ChatBot = ({ context = 'general' }) => {
   const { currentUser } = useAuth();
@@ -30,6 +125,79 @@ const ChatBot = ({ context = 'general' }) => {
   const [loading, setLoading] = useState(false);
   const [userProfile, setUserProfile] = useState(null);
   const messagesEndRef = useRef(null);
+  const pendingMessages = useRef([]);
+  const batchTimeout = useRef(null);
+  const lastWriteTime = useRef(0);
+
+  // Load cached messages on mount
+  useEffect(() => {
+    const cached = localStorage.getItem(MESSAGE_CACHE_KEY);
+    if (cached) {
+      try {
+        const parsedCache = JSON.parse(cached);
+        setMessages(parsedCache);
+        pendingMessages.current = parsedCache;
+      } catch (error) {
+        console.error('Error loading cached messages:', error);
+      }
+    }
+  }, []);
+
+  // Add this function to check if write is allowed
+  const canWrite = () => {
+    const now = Date.now();
+    return now - lastWriteTime.current >= WRITE_INTERVAL;
+  };
+
+  // Function to save messages to Firestore
+  const saveMessagesToFirestore = async (messagesToSave) => {
+    if (!currentUser || !messagesToSave.length) return;
+
+    const now = Date.now();
+    // Only write if enough time has passed since last write
+    if (now - lastWriteTime.current < WRITE_INTERVAL) {
+      return;
+    }
+
+    try {
+      const batch = writeBatch(db);
+      const chatRef = collection(db, 'chatMessages');
+
+      // Only save the last MAX_CACHED_MESSAGES messages
+      const recentMessages = messagesToSave.slice(-MAX_CACHED_MESSAGES);
+
+      recentMessages.forEach(message => {
+        const docRef = doc(chatRef);
+        batch.set(docRef, {
+          content: message.text,
+          userId: currentUser.uid,
+          timestamp: serverTimestamp(),
+          isUser: message.sender === 'user'
+        });
+      });
+
+      await batch.commit();
+      lastWriteTime.current = now;
+      
+      // Clear the cache after successful write
+      pendingMessages.current = [];
+      
+      // Update localStorage
+      localStorage.setItem(MESSAGE_CACHE_KEY, JSON.stringify(messages));
+    } catch (error) {
+      console.error('Error saving messages:', error);
+      // Keep messages in cache if save fails
+      pendingMessages.current = [...pendingMessages.current, ...messagesToSave];
+    }
+  };
+
+  // Debounced save function
+  const debouncedSave = useCallback(
+    debounce((messages) => {
+      saveMessagesToFirestore(messages);
+    }, WRITE_INTERVAL),
+    []
+  );
 
   useEffect(() => {
     if (isOpen) {
@@ -45,31 +213,48 @@ const ChatBot = ({ context = 'general' }) => {
     const loadUserProfile = async () => {
       if (!currentUser) return;
       
+      // Check cache first
+      const cachedProfile = userProfileCache.get(currentUser.uid);
+      if (cachedProfile && Date.now() - cachedProfile.timestamp < CACHE_EXPIRY) {
+        setUserProfile(cachedProfile.data);
+        return;
+      }
+      
       try {
         const userProfileRef = doc(db, 'userProfiles', currentUser.uid);
         const userProfileDoc = await getDoc(userProfileRef);
         
         if (userProfileDoc.exists()) {
-          setUserProfile(userProfileDoc.data());
+          const profileData = userProfileDoc.data();
+          setUserProfile(profileData);
+          // Update cache
+          userProfileCache.set(currentUser.uid, {
+            data: profileData,
+            timestamp: Date.now()
+          });
         } else {
           console.log('No user profile found');
           setUserProfile(null);
         }
       } catch (error) {
         console.error('Error loading user profile:', error);
-        // Set default profile data when offline
-        setUserProfile({
-          age: 'unknown',
-          height: 'unknown',
-          weight: 'unknown',
-          targetWeight: 'unknown',
-          goal: 'unknown',
-          dietaryType: 'unknown',
-          activityLevel: 'unknown',
-          medicalConditions: [],
-          foodAllergies: [],
-          dailyCalories: 'unknown'
-        });
+        // Use cached data if available when offline
+        if (cachedProfile) {
+          setUserProfile(cachedProfile.data);
+        } else {
+          setUserProfile({
+            age: 'unknown',
+            height: 'unknown',
+            weight: 'unknown',
+            targetWeight: 'unknown',
+            goal: 'unknown',
+            dietaryType: 'unknown',
+            activityLevel: 'unknown',
+            medicalConditions: [],
+            foodAllergies: [],
+            dailyCalories: 'unknown'
+          });
+        }
       }
     };
 
@@ -81,16 +266,22 @@ const ChatBot = ({ context = 'general' }) => {
   };
 
   const loadUserDataAndChat = async () => {
-    try {
-      if (!currentUser) return;
+    if (!currentUser) return;
 
-      // Load chat messages
+    // Check cache first
+    const cachedMessages = messageCache.get(currentUser.uid);
+    if (cachedMessages && Date.now() - cachedMessages.timestamp < CACHE_EXPIRY) {
+      setMessages(cachedMessages.data);
+      return;
+    }
+
+    try {
       const chatRef = collection(db, 'chatMessages');
       const q = query(
         chatRef,
         where('userId', '==', currentUser.uid),
         orderBy('timestamp', 'desc'),
-        limit(20)
+        limit(MESSAGE_BATCH_SIZE)
       );
       
       const querySnapshot = await getDocs(q);
@@ -105,10 +296,18 @@ const ChatBot = ({ context = 'general' }) => {
         })
         .reverse();
 
-      console.log('Loaded messages:', loadedMessages);
       setMessages(loadedMessages);
+      // Update cache
+      messageCache.set(currentUser.uid, {
+        data: loadedMessages,
+        timestamp: Date.now()
+      });
     } catch (error) {
       console.error('Error loading chat history:', error);
+      // Use cached messages if available when offline
+      if (cachedMessages) {
+        setMessages(cachedMessages.data);
+      }
     }
   };
 
@@ -220,7 +419,7 @@ const ChatBot = ({ context = 'general' }) => {
   };
 
   const handleSend = async () => {
-    if (!newMessage.trim() || !currentUser) return;
+    if (!newMessage.trim()) return;
 
     const userMessage = {
       text: newMessage.trim(),
@@ -228,21 +427,16 @@ const ChatBot = ({ context = 'general' }) => {
       timestamp: new Date().toISOString()
     };
 
+    // Update UI immediately
     setMessages(prev => [...prev, userMessage]);
     setNewMessage('');
     setLoading(true);
 
     try {
-      // Save user message to Firestore
-      const chatRef = collection(db, 'chatMessages');
-      await addDoc(chatRef, {
-        content: userMessage.text,
-        userId: currentUser.uid,
-        timestamp: serverTimestamp(),
-        isUser: true
-      });
+      // Add to message cache
+      pendingMessages.current.push(userMessage);
 
-      // Generate and save bot response
+      // Generate bot response
       const response = await generateResponse(userMessage.text);
       const botMessage = {
         text: response,
@@ -250,18 +444,20 @@ const ChatBot = ({ context = 'general' }) => {
         timestamp: new Date().toISOString()
       };
 
-      await addDoc(chatRef, {
-        content: response,
-        userId: currentUser.uid,
-        timestamp: serverTimestamp(),
-        isUser: false
-      });
-
+      // Update UI with bot message
       setMessages(prev => [...prev, botMessage]);
+      pendingMessages.current.push(botMessage);
+
+      // Save to localStorage
+      const updatedMessages = [...messages, userMessage, botMessage];
+      localStorage.setItem(MESSAGE_CACHE_KEY, JSON.stringify(updatedMessages));
+
+      // Trigger debounced save to Firestore
+      debouncedSave(pendingMessages.current);
     } catch (error) {
       console.error('Error in chat:', error);
       const errorMessage = {
-        text: "I apologize, but I encountered an error. Please try again or ask a different question.",
+        text: "I apologize, but I encountered an error. Please try again.",
         sender: 'bot',
         timestamp: new Date().toISOString(),
         isError: true
@@ -272,28 +468,34 @@ const ChatBot = ({ context = 'general' }) => {
     }
   };
 
-  return (
-    <>
-      <Fab
-        color="primary"
-        aria-label="chat"
-        sx={{ position: 'fixed', bottom: 16, right: 16 }}
-        onClick={() => setIsOpen(!isOpen)}
-      >
-        <ChatIcon />
-      </Fab>
+  // Save messages to Firestore when component unmounts
+  useEffect(() => {
+    return () => {
+      if (pendingMessages.current.length > 0) {
+        saveMessagesToFirestore(pendingMessages.current);
+      }
+    };
+  }, []);
 
+  return (
+    <Box sx={{ position: 'fixed', bottom: 16, right: 16, zIndex: 1200 }}>
       <Collapse
         in={isOpen}
         sx={{
-          position: 'fixed',
-          bottom: 80,
-          right: 16,
-          width: 320,
+          position: 'absolute',
+          bottom: 64,
+          right: 0,
+          width: 350,
           maxWidth: '90vw',
         }}
       >
-        <Card>
+        <Card sx={{ 
+          width: '100%',
+          maxHeight: '80vh',
+          display: 'flex',
+          flexDirection: 'column',
+          boxShadow: 3
+        }}>
           <Box
             sx={{
               p: 2,
@@ -312,12 +514,12 @@ const ChatBot = ({ context = 'general' }) => {
 
           <Box
             sx={{
-              height: 400,
+              flex: 1,
               overflowY: 'auto',
               p: 2,
               display: 'flex',
               flexDirection: 'column',
-              gap: 2,
+              gap: 2
             }}
           >
             {messages.length === 0 && !loading && (
@@ -332,35 +534,42 @@ const ChatBot = ({ context = 'general' }) => {
                 sx={{
                   display: 'flex',
                   justifyContent: message.sender === 'user' ? 'flex-end' : 'flex-start',
+                  mb: 1
                 }}
               >
-                {message.sender === 'user' && (
-                  <Avatar
-                    sx={{
-                      bgcolor: 'primary.main',
-                      width: 32,
-                      height: 32,
+                {message.sender === 'bot' && (
+                  <Avatar 
+                    sx={{ 
+                      width: 32, 
+                      height: 32, 
                       mr: 1,
+                      bgcolor: 'primary.main'
                     }}
                   >
-                    {currentUser?.displayName?.charAt(0).toUpperCase()}
+                    <ChatIcon sx={{ width: 20, height: 20 }} />
                   </Avatar>
                 )}
-                <Card
+                <Box
                   sx={{
-                    maxWidth: '80%',
+                    maxWidth: '75%',
+                    p: 2,
                     bgcolor: message.sender === 'user' ? 'primary.main' : 'grey.100',
+                    color: message.sender === 'user' ? 'white' : 'text.primary',
+                    borderRadius: 2,
+                    whiteSpace: 'pre-wrap',
+                    '& .bullet-point': {
+                      display: 'flex',
+                      alignItems: 'flex-start',
+                      '&::before': {
+                        content: '"•"',
+                        marginRight: '8px',
+                        marginLeft: '-12px'
+                      }
+                    }
                   }}
                 >
-                  <CardContent sx={{ py: 1, px: 2, '&:last-child': { pb: 1 } }}>
-                    <Typography
-                      variant="body2"
-                      sx={{ color: message.sender === 'user' ? 'white' : 'text.primary' }}
-                    >
-                      {message.text}
-                    </Typography>
-                  </CardContent>
-                </Card>
+                  <MessageContent text={formatMessage(message.text)} />
+                </Box>
               </Box>
             ))}
             <div ref={messagesEndRef} />
@@ -392,7 +601,21 @@ const ChatBot = ({ context = 'general' }) => {
           </Box>
         </Card>
       </Collapse>
-    </>
+      
+      <Fab 
+        color="primary" 
+        onClick={() => setIsOpen(!isOpen)}
+        sx={{ 
+          boxShadow: 3,
+          '&:hover': {
+            transform: 'scale(1.05)',
+            transition: 'transform 0.2s'
+          }
+        }}
+      >
+        {isOpen ? <CloseIcon /> : <ChatIcon />}
+      </Fab>
+    </Box>
   );
 };
 

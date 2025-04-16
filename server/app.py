@@ -13,9 +13,13 @@ import google.generativeai as genai
 import os
 from datetime import datetime
 from efficientnet_pytorch import EfficientNet
+from dotenv import load_dotenv
 
 app = create_app()
 CORS(app)
+
+# Load environment variables
+load_dotenv()
 
 # Load the model and classes
 def load_model():
@@ -49,7 +53,10 @@ transform = transforms.Compose([
 ])
 
 # Configure Gemini
-GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY')
+GOOGLE_API_KEY = os.getenv('GOOGLE_GENAI_API_KEY')  # Use the same env var as Node.js server
+if not GOOGLE_API_KEY:
+    raise ValueError("Missing GOOGLE_GENAI_API_KEY environment variable")
+
 genai.configure(api_key=GOOGLE_API_KEY)
 gemini_model = genai.GenerativeModel('gemini-2.0-flash')
 
@@ -105,75 +112,60 @@ def determineMealTypeByHour(hour):
 @app.route('/detect', methods=['POST'])
 def detect_food():
     try:
-        # Get the image file from the request
         if 'image' not in request.files:
             return jsonify({'success': False, 'error': 'No image file provided'}), 400
 
         image_file = request.files['image']
-        if not image_file:
-            return jsonify({'success': False, 'error': 'No image file provided'}), 400
-
-        # Read and process the image
-        image_bytes = image_file.read()
-        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        image_data = image_file.read()
         
-        # Prepare image for model
-        input_tensor = transform(image).unsqueeze(0)
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        model.to(device)
-        input_tensor = input_tensor.to(device)
+        # Create image data for Gemini
+        image_parts = [
+            {
+                "mime_type": image_file.content_type,
+                "data": image_data
+            }
+        ]
 
-        # Perform inference
-        with torch.no_grad():
-            outputs = model(input_tensor)
-            probabilities = torch.nn.functional.softmax(outputs, dim=1)
-            confidence, predicted_class = torch.max(probabilities, 1)
+        prompt = """Analyze this food image and identify ALL food items present. Return the names in this exact format: ['FOOD_NAME_1', 'FOOD_NAME_2', ...]. 
+        Focus on identifying specific dishes rather than generic categories.
+        For example, prefer 'mango pudding' over 'pudding', 'fig jelly' over 'jelly'.
+        Be as specific as possible with the cuisine and preparation method if visible.
+        No other text."""
 
-        predicted_label = classes[predicted_class.item()]
-        confidence_value = confidence.item()
+        response = gemini_model.generate_content([prompt, image_parts[0]])
+        text = response.text.strip()
 
-        # Get top 3 predictions
-        top_probs, top_classes = torch.topk(probabilities, 3)
-        predictions = []
-        for i in range(3):
-            class_idx = top_classes[0][i].item()
-            prob = top_probs[0][i].item()
-            predictions.append({
-                'label': classes[class_idx],
-                'confidence': prob
-            })
+        # Parse the food items array
+        import re
+        matches = re.search(r'\[(.*)\]', text)
+        if not matches:
+            raise ValueError('Invalid response format from Gemini')
 
-        # Define nutrition values based on the predicted food
-        # TODO: Replace with actual nutrition database lookup
-        nutrition_values = {
-            'calories': 200,  # Default values
-            'protein': 10,
-            'carbs': 25,
-            'fats': 8
-        }
+        food_items = [
+            item.strip().strip('"\'') 
+            for item in matches.group(1).split(',')
+            if item.strip()
+        ]
 
-        # Check confidence threshold
-        if confidence_value < MODEL_CONFIG['confidence_threshold']:
-            return jsonify({
-                'success': False,
-                'error': 'Low confidence in food detection',
-                'predictions': predictions
-            })
+        print(f"Detected food items: {food_items}")
 
-        response = {
+        return jsonify({
             'success': True,
-            'foodItems': [predicted_label],
-            'predictions': predictions,
-            'nutrition': nutrition_values
-        }
-
-        return jsonify(response)
+            'foodItems': food_items,
+            'modelDetails': {
+                'gemini': {
+                    'success': True,
+                    'detected': food_items
+                }
+            }
+        })
 
     except Exception as e:
-        print('Error in detect_food:', str(e))
+        print(f"Error in food detection: {str(e)}")
         return jsonify({
             'success': False,
-            'error': str(e)
+            'error': 'Failed to process image',
+            'details': str(e)
         }), 500
 
 @app.route('/get_nutrition', methods=['POST'])
@@ -185,62 +177,86 @@ def get_nutrition():
         if not food_name:
             return jsonify({'error': 'No food name provided'}), 400
 
-        # Prompt Gemini for nutrition information with more specific instructions
-        prompt = f"""
-        Analyze the nutritional content of one serving of {food_name} and provide accurate values.
-        Return only a JSON object with the following format, no other text:
-        {{
-            "calories": (realistic calories in kcal),
-            "protein": (realistic protein content in grams),
-            "carbs": (realistic carbohydrate content in grams),
-            "fats": (realistic fat content in grams)
-        }}
+        # Handle both single food item and array of food items
+        food_items = food_name if isinstance(food_name, list) else [food_name]
         
-        Ensure values are realistic and specific to {food_name}. Base the values on standard serving sizes.
-        For example:
-        - Rice (1 cup): ~200 calories, 4g protein, 45g carbs, 0g fat
-        - Fried Shrimp (6 pieces): ~230 calories, 14g protein, 16g carbs, 12g fat
-        - Pizza (1 slice): ~285 calories, 12g protein, 36g carbs, 10g fat
-        - Sushi (1 roll): ~250 calories, 9g protein, 38g carbs, 7g fat
-        """
+        prompt = f"""You are a nutrition data API. For each food item in this list: {', '.join(food_items)}, return a JSON object with these exact numeric values (no text, no explanations):
+{{
+  "items": {{
+    "FOOD_NAME_1": {{
+      "calories": number,
+      "protein": number,
+      "carbs": number,
+      "fats": number
+    }},
+    // ... other food items ...
+  }},
+  "total": {{
+    "calories": number (sum of all items),
+    "protein": number (sum of all items),
+    "carbs": number (sum of all items),
+    "fats": number (sum of all items)
+  }}
+}}
+Use average values per serving. Numbers only, no units or ranges."""
 
         response = gemini_model.generate_content(prompt)
         nutrition_text = response.text.strip()
         
         # Clean up the response to ensure it's valid JSON
+        import json
         nutrition_text = nutrition_text.replace('```json', '').replace('```', '').strip()
-        nutrition_data = eval(nutrition_text)  # Convert string to dict
-        
-        # Validate the nutrition data
-        required_keys = ['calories', 'protein', 'carbs', 'fats']
-        for key in required_keys:
-            if key not in nutrition_data or not isinstance(nutrition_data[key], (int, float)):
-                raise ValueError(f"Invalid or missing {key} value")
+        nutrition_data = json.loads(nutrition_text)
 
-        print(f"Nutrition data for {food_name}:", nutrition_data)
-        return jsonify(nutrition_data)
+        # Validate nutrition data
+        if not nutrition_data.get('items') or not nutrition_data.get('total'):
+            raise ValueError('Invalid nutrition data format - missing items or total')
+
+        # Validate each item and total
+        def validate_nutrition(data):
+            required_keys = ['calories', 'protein', 'carbs', 'fats']
+            return all(
+                isinstance(data.get(key), (int, float)) and data.get(key) >= 0 
+                for key in required_keys
+            )
+
+        # Validate total
+        if not validate_nutrition(nutrition_data['total']):
+            raise ValueError('Invalid total nutrition data format')
+
+        # Validate each item
+        for item_name, item_data in nutrition_data['items'].items():
+            if not validate_nutrition(item_data):
+                raise ValueError(f'Invalid nutrition data format for {item_name}')
+
+        # Round all numbers to 1 decimal place
+        def round_nutrition(data):
+            return {
+                'calories': round(data['calories'] * 10) / 10,
+                'protein': round(data['protein'] * 10) / 10,
+                'carbs': round(data['carbs'] * 10) / 10,
+                'fats': round(data['fats'] * 10) / 10
+            }
+
+        processed_data = {
+            'success': True,
+            'items': {
+                name: round_nutrition(item_data)
+                for name, item_data in nutrition_data['items'].items()
+            },
+            'total': round_nutrition(nutrition_data['total'])
+        }
+
+        print(f"Processed nutrition data: {processed_data}")
+        return jsonify(processed_data)
 
     except Exception as e:
-        print(f"Error getting nutrition data: {str(e)}")
-        # Return reasonable default values based on the food type
-        default_values = {
-            'rice': {'calories': 200, 'protein': 4, 'carbs': 45, 'fats': 0},
-            'fried shrimp': {'calories': 230, 'protein': 14, 'carbs': 16, 'fats': 12},
-            'pizza': {'calories': 285, 'protein': 12, 'carbs': 36, 'fats': 10},
-            'sushi': {'calories': 250, 'protein': 9, 'carbs': 38, 'fats': 7}
-        }
-        
-        food_name_lower = food_name.lower()
-        for key in default_values:
-            if key in food_name_lower:
-                return jsonify(default_values[key])
-                
+        print(f"Error getting nutrition data:\n  {str(e)}")
         return jsonify({
-            'calories': 200,
-            'protein': 10,
-            'carbs': 25,
-            'fats': 8
-        })
+            'success': False,
+            'error': 'Failed to get nutrition data',
+            'details': str(e)
+        }), 500
 
 if __name__ == '__main__':
     app.run(**SERVER_CONFIG) 

@@ -30,11 +30,13 @@ import {
   PendingActions as PendingIcon,
   ChevronLeft as ChevronLeftIcon,
   ChevronRight as ChevronRightIcon,
-  Close as CloseIcon
+  Close as CloseIcon,
+  Delete as DeleteIcon,
+  Cancel as CancelIcon
 } from '@mui/icons-material';
 import Webcam from 'react-webcam';
 import { db, auth } from '../firebase/config';
-import { doc, setDoc, getDoc, collection, query, where, getDocs, orderBy, serverTimestamp, updateDoc, addDoc, arrayUnion, increment } from 'firebase/firestore';
+import { doc, setDoc, getDoc, collection, query, where, getDocs, orderBy, serverTimestamp, updateDoc, addDoc, arrayUnion, increment, onSnapshot, writeBatch, limit } from 'firebase/firestore';
 import { useNavigate } from 'react-router-dom';
 import { AdapterDateFns } from '@mui/x-date-pickers/AdapterDateFns';
 import { LocalizationProvider } from '@mui/x-date-pickers/LocalizationProvider';
@@ -42,6 +44,8 @@ import { StaticDatePicker } from '@mui/x-date-pickers/StaticDatePicker';
 import { API_ENDPOINTS, API_CONFIG } from '../config/api';
 import { useAuth } from '../contexts/AuthContext';
 import * as firebase from 'firebase/app';
+import Calendar from 'react-calendar';
+import { debounce } from 'lodash';
 
 const MEAL_ORDER = ['breakfast', 'lunch', 'snacks', 'dinner'];
 const MEAL_TIMES = [
@@ -51,6 +55,22 @@ const MEAL_TIMES = [
   { name: 'Dinner', time: '7:30 PM - 12:00 AM' }
 ];
 
+// Add these constants at the top of the file, after the imports
+const MAX_DAILY_WRITES = 50;
+const MAX_TOTAL_WRITES = 1000;
+
+// Add these constants at the top level
+const MEAL_STATUS_CACHE_KEY = 'mealStatusCache';
+const STREAK_CACHE_KEY = 'streakCache';
+const WRITE_BATCH_DELAY = 60000; // 1 minute
+const BATCH_UPDATE_DELAY = 60000; // 1 minute
+const MAX_CACHED_UPDATES = 20;
+const pendingUpdates = new Map();
+let lastWriteTime = 0;
+let lastWriteStatus = null;
+let lastMealStatus = null;
+let lastFirestoreWrite = 0;
+
 // Utility function to format date as YYYY-MM-DD
 const formatDate = (date) => {
   const year = date.getFullYear();
@@ -59,7 +79,143 @@ const formatDate = (date) => {
   return `${year}-${month}-${day}`;
 };
 
+// Add this function near the top of the file, after the imports
+const calculateNutrientsReached90Percent = (progress, mealType, dietPlan) => {
+  const nutrients = ['protein', 'carbs', 'fats'];
+  return nutrients.filter(nutrient => {
+    const target = dietPlan?.recommendations?.dailyTargets?.[mealType]?.[nutrient] || 0;
+    return target > 0 && (progress[nutrient] / target) >= 0.9;
+  }).length;
+};
+
+const calculateNutrientsReached85Percent = (progress, mealType, dietPlan) => {
+  const nutrients = ['protein', 'carbs', 'fats'];
+  return nutrients.filter(nutrient => {
+    const target = dietPlan?.recommendations?.dailyTargets?.[mealType]?.[nutrient] || 0;
+    return target > 0 && (progress[nutrient] / target) >= 0.85;
+  }).length;
+};
+
+// Add this function near the top of the file
+const cleanupOldData = () => {
+  try {
+    const today = new Date().toISOString().split('T')[0];
+    const thirtyDaysAgo = new Date();
+    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+    const cutoffDate = thirtyDaysAgo.toISOString().split('T')[0];
+
+    // Clean up old meal status data
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      if (key.startsWith('mealStatus_')) {
+        const date = key.split('_')[1];
+        if (date < cutoffDate) {
+          localStorage.removeItem(key);
+        }
+      }
+    }
+
+    // Clean up old migration flags
+    const migrationDate = localStorage.getItem('migrationDate');
+    if (migrationDate && migrationDate < cutoffDate) {
+      localStorage.removeItem('migrationCompleted');
+      localStorage.removeItem('migrationDate');
+    }
+  } catch (error) {
+    console.error('Error cleaning up old data:', error);
+  }
+};
+
+// Add this function at the top level
+const updateStreakHistory = async (userId) => {
+  try {
+    const today = new Date().toISOString().split('T')[0];
+    const streakRef = doc(db, 'userStreaks', userId);
+    const streakDoc = await getDoc(streakRef);
+    
+    // Get existing history or create new
+    let history = {};
+    if (streakDoc.exists()) {
+      history = streakDoc.data().history || {};
+    }
+    
+    // Fill in missing dates up to today
+    const lastDate = Object.keys(history).sort().pop() || today;
+    let currentDate = new Date(lastDate);
+    const todayDate = new Date(today);
+    
+    while (currentDate <= todayDate) {
+      const dateStr = currentDate.toISOString().split('T')[0];
+      if (!history.hasOwnProperty(dateStr)) {
+        history[dateStr] = false;
+      }
+      currentDate.setDate(currentDate.getDate() + 1);
+    }
+    
+    // Update Firestore with a batch write to ensure atomicity
+    const batch = writeBatch(db);
+    batch.set(streakRef, {
+      history,
+      lastUpdated: serverTimestamp(),
+      userId
+    }, { merge: true });
+    
+    await batch.commit();
+    return history;
+  } catch (error) {
+    console.error('Error updating streak history:', error);
+    throw error;
+  }
+};
+
+// Add these utility functions at the top level
+const DEBOUNCE_DELAY = 2000; // 2 seconds delay
+
+const debouncedFirestoreUpdate = debounce(async (userId, today, newMealStatus) => {
+  try {
+    const mealStatusRef = doc(db, 'userMealStatus', userId);
+    await setDoc(mealStatusRef, {
+      [today]: newMealStatus,
+      lastUpdated: serverTimestamp()
+    }, { merge: true });
+  } catch (error) {
+    console.error('Error in debouncedFirestoreUpdate:', error);
+  }
+}, DEBOUNCE_DELAY);
+
+// Add this function to handle batched writes
+const batchedFirestoreWrite = debounce(async (userId, updates) => {
+  try {
+    const mealStatusRef = doc(db, 'userMealStatus', userId);
+    await setDoc(mealStatusRef, updates, { merge: true });
+  } catch (error) {
+    console.error('Error in batched write:', error);
+  }
+}, WRITE_BATCH_DELAY);
+
+// Add this near the top of the file, after the imports
+const getApiBaseUrl = () => {
+  const host = window.location.hostname;
+  const isLocalhost = host === 'localhost' || host === '127.0.0.1';
+  const port = isLocalhost ? '5000' : '443';
+  const protocol = isLocalhost ? 'http' : 'https';
+  return `${protocol}://${host}:${port}`;
+};
+
+// Update the API_BASE_URL constant
+const API_BASE_URL = getApiBaseUrl();
+
+// Add this function near the top of the file, after the imports
+const getServerUrl = () => {
+  const host = window.location.hostname;
+  const isLocalhost = host === 'localhost' || host === '127.0.0.1';
+  const port = isLocalhost ? '5000' : '443';
+  const protocol = isLocalhost ? 'http' : 'https';
+  return `${protocol}://${host}:${port}`;
+};
+
 const Dashboard = () => {
+  // State declarations
   const [isCameraActive, setIsCameraActive] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
   const [error, setError] = useState(null);
@@ -79,7 +235,14 @@ const Dashboard = () => {
   });
   const [loading, setLoading] = useState(true);
   const [dietPlan, setDietPlan] = useState(null);
-  const [todaysMeals, setTodaysMeals] = useState({});
+  const [todaysMeals, setTodaysMeals] = useState({
+    breakfast: { calories: 0, protein: 0, carbs: 0, fats: 0 },
+    lunch: { calories: 0, protein: 0, carbs: 0, fats: 0 },
+    dinner: { calories: 0, protein: 0, carbs: 0, fats: 0 },
+    snacks: { calories: 0, protein: 0, carbs: 0, fats: 0 }
+  });
+  const [isUploading, setIsUploading] = useState(false);
+  const lastUploadedMeal = useRef(null);
   const [userProfile, setUserProfile] = useState(null);
   const [activeTargetIndex, setActiveTargetIndex] = useState(() => {
     const now = new Date();
@@ -115,6 +278,247 @@ const Dashboard = () => {
   const streamRef = useRef(null);
   const [completedDates, setCompletedDates] = useState([]);
   const [missedDates, setMissedDates] = useState([]);
+  const [snackbar, setSnackbar] = useState({ open: false, message: '', severity: 'success' });
+  const migrationCompletedRef = useRef(false);
+  const [firestoreError, setFirestoreError] = useState(null);
+  const [isQuotaExceeded, setIsQuotaExceeded] = useState(false);
+  const [writeCount, setWriteCount] = useState(0);
+  const [dailyWriteCount, setDailyWriteCount] = useState(0);
+  const [lastWriteDate, setLastWriteDate] = useState(null);
+  const [processingStatus, setProcessingStatus] = useState('');
+  const [showResults, setShowResults] = useState(false);
+  const [detectedItems, setDetectedItems] = useState([]);
+  const [nutritionData, setNutritionData] = useState(null);
+  const [currentMealData, setCurrentMealData] = useState({ items: [], nutrition: {} });
+  const [hasUploaded, setHasUploaded] = useState(false);
+  const [dailyTargets, setDailyTargets] = useState({
+    breakfast: { calories: 0, protein: 0, carbs: 0, fats: 0 },
+    lunch: { calories: 0, protein: 0, carbs: 0, fats: 0 },
+    dinner: { calories: 0, protein: 0, carbs: 0, fats: 0 },
+    snacks: { calories: 0, protein: 0, carbs: 0, fats: 0 }
+  });
+  const [progress, setProgress] = useState({
+    calories: 0,
+    protein: 0,
+    carbs: 0,
+    fats: 0
+  });
+  const [todayMeals, setTodayMeals] = useState([]);
+
+  // Fetch diet plan and meals data
+  useEffect(() => {
+    const fetchData = async () => {
+      try {
+        if (!auth.currentUser) {
+          setError('Please sign in to view your dashboard');
+          setLoading(false);
+          return;
+        }
+
+        // Fetch diet plan from dietPlans collection
+        let planData = null;
+        const dietPlansRef = doc(db, 'dietPlans', auth.currentUser.uid);
+        const dietPlanDoc = await getDoc(dietPlansRef);
+
+        if (dietPlanDoc.exists()) {
+          planData = dietPlanDoc.data();
+        } else {
+          // If no direct document exists, try querying the collection
+          const q = query(
+            collection(db, 'dietPlans'),
+            where('userId', '==', auth.currentUser.uid),
+            orderBy('createdAt', 'desc'),
+            limit(1)
+          );
+          const querySnapshot = await getDocs(q);
+          
+          if (!querySnapshot.empty) {
+            planData = querySnapshot.docs[0].data();
+          }
+        }
+
+        if (planData) {
+          console.log('Fetched diet plan:', planData); // Debug log
+          setDietPlan(planData);
+          
+          if (planData.dailyTargets) {
+            setDailyTargets(planData.dailyTargets);
+            
+            // Update dailyProgress with the total targets
+            const totalTargets = {
+              calories: Object.values(planData.dailyTargets).reduce((sum, meal) => sum + meal.calories, 0),
+              protein: Object.values(planData.dailyTargets).reduce((sum, meal) => sum + meal.protein, 0),
+              carbs: Object.values(planData.dailyTargets).reduce((sum, meal) => sum + meal.carbs, 0),
+              fats: Object.values(planData.dailyTargets).reduce((sum, meal) => sum + meal.fats, 0)
+            };
+
+            setDailyProgress({
+              calories: { current: 0, target: totalTargets.calories },
+              protein: { current: 0, target: totalTargets.protein },
+              carbs: { current: 0, target: totalTargets.carbs },
+              fats: { current: 0, target: totalTargets.fats }
+            });
+          }
+        }
+
+        // Fetch today's meals
+        const today = new Date().toISOString().split('T')[0];
+        const mealsRef = doc(db, 'userMeals', auth.currentUser.uid);
+        const mealsDoc = await getDoc(mealsRef);
+        
+        if (mealsDoc.exists()) {
+          const mealsData = mealsDoc.data();
+          const todaysMealData = mealsData[today] || [];
+          
+          const meals = {
+            breakfast: { calories: 0, protein: 0, carbs: 0, fats: 0 },
+            lunch: { calories: 0, protein: 0, carbs: 0, fats: 0 },
+            dinner: { calories: 0, protein: 0, carbs: 0, fats: 0 },
+            snacks: { calories: 0, protein: 0, carbs: 0, fats: 0 }
+          };
+
+          todaysMealData.forEach(meal => {
+            const mealType = meal.mealType;
+            if (!mealType) return;
+
+            const nutrition = meal.nutrition || {};
+            meals[mealType].calories += Number(nutrition.calories) || 0;
+            meals[mealType].protein += Number(nutrition.protein) || 0;
+            meals[mealType].carbs += Number(nutrition.carbs) || 0;
+            meals[mealType].fats += Number(nutrition.fats) || 0;
+          });
+
+          setTodaysMeals(meals);
+        }
+      } catch (error) {
+        console.error('Error fetching data:', error);
+        setError('Failed to load dashboard data');
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    fetchData();
+  }, [currentUser]);
+
+  // Handle meal addition
+  const handleAddMeal = useCallback(async (mealData) => {
+    try {
+      if (!auth.currentUser) return;
+
+      const userId = auth.currentUser.uid;
+      const today = new Date().toISOString().split('T')[0];
+      const currentHour = new Date().getHours() + new Date().getMinutes() / 60;
+      const mealType = determineMealTypeByHour(currentHour);
+
+      // Ensure mealData has the required structure
+      if (!mealData || !mealData.nutrition) {
+        throw new Error('Invalid meal data structure');
+      }
+
+      // 1. Update userMeals collection
+      const mealsRef = doc(db, 'userMeals', userId);
+      const mealsDoc = await getDoc(mealsRef);
+      
+      // Initialize the data structure if it doesn't exist
+      let currentMeals = {};
+      if (mealsDoc.exists()) {
+        currentMeals = mealsDoc.data();
+      }
+      
+      // Initialize today's meals array if it doesn't exist
+      if (!currentMeals[today]) {
+        currentMeals[today] = [];
+      }
+
+      // Create the new meal object with proper structure
+      const newMeal = {
+        foodName: mealData.foodName || 'Unknown Food',
+        name: mealData.name || mealData.foodName || 'Unknown Food',
+        nutrition: {
+          calories: Number(mealData.nutrition.calories) || 0,
+          protein: Number(mealData.nutrition.protein) || 0,
+          carbs: Number(mealData.nutrition.carbs) || 0,
+          fats: Number(mealData.nutrition.fats) || 0
+        },
+        mealType,
+        timestamp: new Date().toISOString()
+      };
+
+      // Add the new meal to today's meals
+      currentMeals[today].push(newMeal);
+      await setDoc(mealsRef, currentMeals, { merge: true });
+
+      // Update local state
+      setTodaysMeals(prev => {
+        const updatedMeals = { ...prev };
+        const currentMeal = updatedMeals[mealType] || { calories: 0, protein: 0, carbs: 0, fats: 0 };
+        
+        updatedMeals[mealType] = {
+          calories: currentMeal.calories + newMeal.nutrition.calories,
+          protein: currentMeal.protein + newMeal.nutrition.protein,
+          carbs: currentMeal.carbs + newMeal.nutrition.carbs,
+          fats: currentMeal.fats + newMeal.nutrition.fats
+        };
+        
+        return updatedMeals;
+      });
+
+      // Update meal status
+      const newMealStatus = { ...mealStatus };
+      newMealStatus[mealType] = true;
+      setMealStatus(newMealStatus);
+
+      // Show success message
+      setSnackbar({
+        open: true,
+        message: `Added ${newMeal.foodName} to ${mealType}`,
+        severity: 'success'
+      });
+
+    } catch (error) {
+      console.error('Error adding meal:', error);
+      setError('Failed to add meal. Please try again.');
+    }
+  }, [auth.currentUser, mealStatus]);
+
+  // Calculate progress percentages and update meal status
+  useEffect(() => {
+    if (todayMeals && todayMeals.length > 0 && dailyTargets.calories > 0) {
+      const totalConsumed = todayMeals.reduce((acc, meal) => ({
+        calories: acc.calories + (meal.nutrition?.calories || 0),
+        protein: acc.protein + (meal.nutrition?.protein || 0),
+        carbs: acc.carbs + (meal.nutrition?.carbs || 0),
+        fats: acc.fats + (meal.nutrition?.fats || 0)
+      }), { calories: 0, protein: 0, carbs: 0, fats: 0 });
+
+      // Calculate percentages
+      const percentages = {
+        calories: (totalConsumed.calories / dailyTargets.calories) * 100,
+        protein: (totalConsumed.protein / dailyTargets.protein) * 100,
+        carbs: (totalConsumed.carbs / dailyTargets.carbs) * 100,
+        fats: (totalConsumed.fats / dailyTargets.fats) * 100
+      };
+
+      setProgress({
+        calories: Math.min(percentages.calories, 100),
+        protein: Math.min(percentages.protein, 100),
+        carbs: Math.min(percentages.carbs, 100),
+        fats: Math.min(percentages.fats, 100)
+      });
+
+      // Update meal status if all nutrients are at least 85% of target
+      const allTargetsMet = Object.values(percentages).every(percent => percent >= 85);
+      
+      if (allTargetsMet && !mealStatus) {
+        const today = new Date().toISOString().split('T')[0];
+        updateDoc(doc(db, 'users', currentUser.uid), {
+          [`mealStatus.${today}`]: true
+        });
+        setMealStatus(true);
+      }
+    }
+  }, [todayMeals, dailyTargets, currentUser, mealStatus]);
 
   useEffect(() => {
     // Check if user is logged in
@@ -155,7 +559,26 @@ const Dashboard = () => {
     return () => clearInterval(interval);
   }, []);
 
+  // Add error handling wrapper for Firestore operations
+  const safeFirestoreOperation = async (operation) => {
+    try {
+      return await operation();
+    } catch (error) {
+      if (error.code === 'resource-exhausted') {
+        setIsQuotaExceeded(true);
+        setFirestoreError('Firestore quota exceeded. Using cached data.');
+        return null;
+      }
+      console.error('Firestore error:', error);
+      return null;
+    }
+  };
+
+  // Modify fetchUserData to handle quota exceeded
   useEffect(() => {
+    let unsubscribeAuth = null;
+    let unsubscribeMeals = null;
+
     const fetchUserData = async () => {
       try {
         if (!auth.currentUser) return;
@@ -163,125 +586,26 @@ const Dashboard = () => {
         const userId = auth.currentUser.uid;
         const today = new Date().toISOString().split('T')[0];
 
-        // Load saved meal status
-        const savedStatus = localStorage.getItem(`mealStatus_${today}`);
-        if (savedStatus) {
-          setMealStatus(JSON.parse(savedStatus));
-        }
+        // Single fetch for initial data
+        const mealsRef = doc(db, 'userMeals', userId);
+        const mealsDoc = await getDoc(mealsRef);
 
-        // Fetch user profile
-        const userProfileRef = doc(db, 'userProfiles', userId);
-        const userProfileDoc = await getDoc(userProfileRef);
-        
-        if (userProfileDoc.exists()) {
-          const profileData = userProfileDoc.data();
-          setUserProfile(profileData);
-        }
-
-        // Fetch diet plan for daily targets
-        const dietPlanRef = doc(db, 'dietPlans', userId);
-        const dietPlanDoc = await getDoc(dietPlanRef);
-        
-        if (dietPlanDoc.exists()) {
-          const dietPlanData = dietPlanDoc.data();
-          const dailyTargets = dietPlanData.dailyTargets || {
+        if (mealsDoc.exists()) {
+          const data = mealsDoc.data();
+          const todaysMealData = data[today] || [];
+          
+          const meals = {
             breakfast: { calories: 0, protein: 0, carbs: 0, fats: 0 },
             lunch: { calories: 0, protein: 0, carbs: 0, fats: 0 },
             dinner: { calories: 0, protein: 0, carbs: 0, fats: 0 },
             snacks: { calories: 0, protein: 0, carbs: 0, fats: 0 }
           };
 
-          // Calculate total daily targets
-          const totalDailyTargets = {
-            calories: Object.values(dailyTargets).reduce((sum, meal) => sum + meal.calories, 0),
-            protein: Object.values(dailyTargets).reduce((sum, meal) => sum + meal.protein, 0),
-            carbs: Object.values(dailyTargets).reduce((sum, meal) => sum + meal.carbs, 0),
-            fats: Object.values(dailyTargets).reduce((sum, meal) => sum + meal.fats, 0)
-          };
-
-          // Fetch current progress from Firestore
-          const progressRef = doc(db, 'userProgress', userId);
-          const progressDoc = await getDoc(progressRef);
-          let currentProgress = {
-            calories: 0,
-            protein: 0,
-            carbs: 0,
-            fats: 0
-          };
-
-          if (progressDoc.exists()) {
-            const progressData = progressDoc.data();
-            if (progressData[today]) {
-              currentProgress = {
-                calories: progressData[today].calories || 0,
-                protein: progressData[today].protein || 0,
-                carbs: progressData[today].carbs || 0,
-                fats: progressData[today].fats || 0
-              };
-            } else {
-              // If no progress for today, create a new progress document
-              await setDoc(progressRef, {
-                [today]: {
-                  calories: 0,
-                  protein: 0,
-                  carbs: 0,
-                  fats: 0,
-                  userId: userId,
-                  lastUpdated: new Date().toISOString()
-                }
-              }, { merge: true });
-            }
-          } else {
-            // If no progress document exists, create one
-            await setDoc(progressRef, {
-              [today]: {
-                calories: 0,
-                protein: 0,
-                carbs: 0,
-                fats: 0,
-                userId: userId,
-                lastUpdated: new Date().toISOString()
-              }
-            });
-          }
-
-          // Set daily progress with current values and targets
-          setDailyProgress({
-            calories: { current: currentProgress.calories, target: totalDailyTargets.calories },
-            protein: { current: currentProgress.protein, target: totalDailyTargets.protein },
-            carbs: { current: currentProgress.carbs, target: totalDailyTargets.carbs },
-            fats: { current: currentProgress.fats, target: totalDailyTargets.fats }
-          });
-
-          // Set the diet plan with the meal-specific targets
-          setDietPlan({
-            recommendations: {
-              dailyTargets: dailyTargets
-            }
-          });
-        }
-
-        // Fetch today's meals
-        const mealsRef = doc(db, 'userMeals', userId);
-        const mealsDoc = await getDoc(mealsRef);
-        
-        const meals = {};
-        if (mealsDoc.exists()) {
-          const todaysMealData = mealsDoc.data()[today] || [];
-          
-          // Make sure we're working with an array
           if (Array.isArray(todaysMealData)) {
             todaysMealData.forEach(meal => {
               const mealType = meal.mealType;
-              if (!meals[mealType]) {
-                meals[mealType] = {
-                  calories: 0,
-                  protein: 0,
-                  carbs: 0,
-                  fats: 0
-                };
-              }
-              // Make sure we're accessing nutrition data correctly
+              if (!mealType) return;
+
               const nutrition = meal.nutrition || {};
               meals[mealType].calories += Number(nutrition.calories) || 0;
               meals[mealType].protein += Number(nutrition.protein) || 0;
@@ -289,220 +613,76 @@ const Dashboard = () => {
               meals[mealType].fats += Number(nutrition.fats) || 0;
             });
           }
+
+          setTodaysMeals(meals);
+
+          // Update meal status only if needed
+          const newMealStatus = {
+            breakfast: meals.breakfast.calories > 0,
+            lunch: meals.lunch.calories > 0,
+            dinner: meals.dinner.calories > 0,
+            snacks: meals.snacks.calories > 0
+          };
+
+          const statusChanged = Object.keys(newMealStatus).some(
+            mealType => newMealStatus[mealType] !== mealStatus[mealType]
+          );
+
+          if (statusChanged && canWriteToFirestore()) {
+            setMealStatus(newMealStatus);
+            const mealStatusRef = doc(db, 'userMealStatus', userId);
+            await setDoc(mealStatusRef, {
+              [today]: newMealStatus,
+              lastUpdated: serverTimestamp()
+            }, { merge: true });
+            setWriteCount(prev => prev + 1);
+            setDailyWriteCount(prev => prev + 1);
+          }
         }
 
-        // Update local state with accumulated values
-        setTodaysMeals(meals);
-        updateMealStatus(meals);
-
-        // Update progress in Firestore with the correct totals
-        const progressRef = doc(db, 'userProgress', userId);
-        const totalProgress = {
-          calories: 0,
-          protein: 0,
-          carbs: 0,
-          fats: 0
-        };
-
-        // Calculate total progress across all meals
-        Object.values(meals).forEach(meal => {
-          totalProgress.calories += Number(meal.calories) || 0;
-          totalProgress.protein += Number(meal.protein) || 0;
-          totalProgress.carbs += Number(meal.carbs) || 0;
-          totalProgress.fats += Number(meal.fats) || 0;
-        });
-
-        await setDoc(progressRef, {
-          [today]: {
-            ...totalProgress,
-            lastUpdated: new Date().toISOString()
+        // Update streak history
+        try {
+          await updateStreakHistory(userId);
+        } catch (error) {
+          if (error.code === 'resource-exhausted') {
+            setIsQuotaExceeded(true);
+            console.log('Firestore quota exceeded during streak update');
           }
-        }, { merge: true });
+        }
 
       } catch (error) {
         console.error('Error fetching user data:', error);
-        setError('Failed to load your data. Please try again.');
+        if (error.code === 'resource-exhausted') {
+          setIsQuotaExceeded(true);
+        }
+        setError('Failed to load your data. Using cached data.');
       } finally {
         setLoading(false);
       }
     };
 
-    fetchUserData();
-
-    // Set up a timer to check for day change
-    const checkDayChange = () => {
-      const now = new Date();
-      if (now.getHours() === 0 && now.getMinutes() === 0) {
-        checkAndUpdateStreak();
+    unsubscribeAuth = auth.onAuthStateChanged((user) => {
+      if (user) {
         fetchUserData();
+      } else {
+        navigate('/login');
       }
-    };
-
-    const dayChangeTimer = setInterval(checkDayChange, 60000);
-    return () => clearInterval(dayChangeTimer);
-  }, []);
-
-  const calculateDailyTargets = (profile) => {
-    // BMR calculation using Mifflin-St Jeor Equation
-    const bmr = profile.gender === 'male'
-      ? (10 * profile.weight) + (6.25 * profile.height) - (5 * profile.age) + 5
-      : (10 * profile.weight) + (6.25 * profile.height) - (5 * profile.age) - 161;
-
-    // Activity factor
-    const activityFactors = {
-      sedentary: 1.2,
-      light: 1.375,
-      moderate: 1.55,
-      active: 1.725,
-      veryActive: 1.9
-    };
-
-    const tdee = bmr * (activityFactors[profile.activityLevel] || 1.2);
-    
-    // Adjust based on goal
-    let targetCalories = tdee;
-    if (profile.goal === 'weightLoss') {
-      targetCalories *= 0.8; // 20% deficit
-    } else if (profile.goal === 'weightGain') {
-      targetCalories *= 1.2; // 20% surplus
-    }
-
-    // Calculate macros
-    const protein = profile.weight * (profile.goal === 'weightGain' ? 2.2 : 2); // g/kg
-    const fats = (targetCalories * 0.25) / 9; // 25% of calories from fat
-    const carbs = (targetCalories - (protein * 4) - (fats * 9)) / 4;
-
-    // Meal distribution percentages
-    const mealDistribution = {
-      breakfast: 0.20, // 20% - Lighter breakfast
-      lunch: 0.35,     // 35% - Main meal
-      dinner: 0.30,    // 30% - Substantial dinner but lighter than lunch
-      snacks: 0.15     // 15% - Divided between morning and afternoon snacks
-    };
-
-    // Distribute across meals with different ratios
-    return {
-      breakfast: {
-        calories: Math.round(targetCalories * mealDistribution.breakfast),
-        protein: Math.round(protein * mealDistribution.breakfast),
-        carbs: Math.round(carbs * mealDistribution.breakfast),
-        fats: Math.round(fats * mealDistribution.breakfast)
-      },
-      lunch: {
-        calories: Math.round(targetCalories * mealDistribution.lunch),
-        protein: Math.round(protein * mealDistribution.lunch),
-        carbs: Math.round(carbs * mealDistribution.lunch),
-        fats: Math.round(fats * mealDistribution.lunch)
-      },
-      dinner: {
-        calories: Math.round(targetCalories * mealDistribution.dinner),
-        protein: Math.round(protein * mealDistribution.dinner),
-        carbs: Math.round(carbs * mealDistribution.dinner),
-        fats: Math.round(fats * mealDistribution.dinner)
-      },
-      snacks: {
-        calories: Math.round(targetCalories * mealDistribution.snacks),
-        protein: Math.round(protein * mealDistribution.snacks),
-        carbs: Math.round(carbs * mealDistribution.snacks),
-        fats: Math.round(fats * mealDistribution.snacks)
-      }
-    };
-  };
-
-  const updateMealStatus = async (meals) => {
-    const targets = {
-      breakfast: { calories: 520, protein: 30, carbs: 65, fats: 15 },
-      lunch: { calories: 520, protein: 30, carbs: 65, fats: 15 },
-      snacks: { calories: 520, protein: 30, carbs: 65, fats: 15 },
-      dinner: { calories: 520, protein: 30, carbs: 65, fats: 15 }
-    };
-
-    const newMealStatus = {};
-    MEAL_ORDER.forEach(mealType => {
-      const meal = meals[mealType] || { calories: 0, protein: 0, carbs: 0, fats: 0 };
-      const target = targets[mealType];
-
-      // Calculate progress percentages for each nutrient
-      const progress = {
-        calories: (meal.calories / target.calories) * 100,
-        protein: (meal.protein / target.protein) * 100,
-        carbs: (meal.carbs / target.carbs) * 100,
-        fats: (meal.fats / target.fats) * 100
-      };
-
-      // A meal is complete if ANY of these conditions are met:
-      // 1. Total calories reached 90% of target
-      // 2. At least 2 nutrients (protein, carbs, fats) reached 90% of their targets
-      const nutrientsReached90Percent = [
-        progress.protein >= 90,
-        progress.carbs >= 90,
-        progress.fats >= 90
-      ].filter(Boolean).length;
-
-      newMealStatus[mealType] = progress.calories >= 90 || nutrientsReached90Percent >= 2;
     });
 
-    // Save to localStorage
+    return () => {
+      if (unsubscribeAuth) unsubscribeAuth();
+      if (unsubscribeMeals) unsubscribeMeals();
+    };
+  }, [navigate]);
+
+  // Add this function to check write limits
+  const canWriteToFirestore = () => {
     const today = new Date().toISOString().split('T')[0];
-    localStorage.setItem(`mealStatus_${today}`, JSON.stringify(newMealStatus));
-    setMealStatus(newMealStatus);
-
-    console.log('Updated meal status:', newMealStatus); // Debug log
-  };
-
-  // Add this useEffect to load meal status on mount
-  useEffect(() => {
-    const today = new Date().toISOString().split('T')[0];
-    const savedStatus = localStorage.getItem(`mealStatus_${today}`);
-    if (savedStatus) {
-      setMealStatus(JSON.parse(savedStatus));
+    if (lastWriteDate !== today) {
+      setDailyWriteCount(0);
+      setLastWriteDate(today);
     }
-  }, []);
-
-  const updateMealProgress = async (mealType, nutrition) => {
-    try {
-      if (!auth.currentUser) return;
-
-      const today = new Date().toISOString().split('T')[0];
-      const mealRef = doc(db, 'userMeals', auth.currentUser.uid);
-      
-      // Store the meal in Firestore
-      await setDoc(mealRef, {
-        [today]: {
-          [mealType]: {
-            nutrition,
-            timestamp: serverTimestamp()
-          }
-        }
-      }, { merge: true });
-
-      // Update local state
-      const currentMeal = todaysMeals[mealType] || {
-        calories: 0,
-        protein: 0,
-        carbs: 0,
-        fats: 0
-      };
-
-      const updatedMeal = {
-        calories: currentMeal.calories + (nutrition.calories || 0),
-        protein: currentMeal.protein + (nutrition.protein || 0),
-        carbs: currentMeal.carbs + (nutrition.carbs || 0),
-        fats: currentMeal.fats + (nutrition.fats || 0)
-      };
-
-      const newTodaysMeals = {
-        ...todaysMeals,
-        [mealType]: updatedMeal
-      };
-
-      setTodaysMeals(newTodaysMeals);
-      updateMealStatus(newTodaysMeals);
-
-    } catch (error) {
-      console.error('Error updating meal progress:', error);
-      setError('Failed to update meal progress');
-    }
+    return writeCount < MAX_TOTAL_WRITES && dailyWriteCount < MAX_DAILY_WRITES;
   };
 
   const handlePrevTarget = () => {
@@ -513,338 +693,85 @@ const Dashboard = () => {
     setActiveTargetIndex((prev) => (prev + 1) % MEAL_ORDER.length);
   };
 
-  const handleMealCheck = (meal) => {
-    // Disable manual checking - meals are checked automatically based on progress
-    return;
-  };
+  const debouncedUpdateMealStatus = async (userId, date, status) => {
+    // Store the update in the pending map
+    const key = `${userId}_${date}`;
+    pendingUpdates.set(key, status);
 
-  const checkCameraAvailability = useCallback(async () => {
-    try {
-      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-        console.log('MediaDevices API not available');
-        setHasCamera(false);
-        setCameraError('Camera API is not available in your browser');
-        return;
-      }
-
-      const devices = await navigator.mediaDevices.enumerateDevices();
-      const videoDevices = devices.filter(device => device.kind === 'videoinput');
-      
-      if (videoDevices.length === 0) {
-        setHasCamera(false);
-        setCameraError('No camera found on this device');
-        return;
-      }
-
-      setHasCamera(true);
-    } catch (error) {
-      console.error('Error checking camera:', error);
-      setHasCamera(false);
-      setCameraError('Failed to check camera availability');
+    // Clear any existing timeout
+    if (pendingUpdates.timeout) {
+      clearTimeout(pendingUpdates.timeout);
     }
-  }, []);
 
-  useEffect(() => {
-    checkCameraAvailability();
-  }, [checkCameraAvailability]);
-
-  const activateCamera = async () => {
-    try {
-      setError(null);
-      setCameraError(null);
-
-      // Check if browser supports getUserMedia
-      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-        throw new Error('Your browser does not support camera access');
-      }
-
-      // Request camera permissions
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: {
-          facingMode: 'environment',
-          width: { ideal: 1920 },
-          height: { ideal: 1080 }
-        }
-      });
-
-      // Update state and refs
-      setHasCamera(true);
-      setCameraPermission('granted');
-      setIsCameraActive(true);
-      
-      // Set up video stream
-      if (webcamRef.current && webcamRef.current.video) {
-        webcamRef.current.video.srcObject = stream;
-      }
-      
-      streamRef.current = stream;
-    } catch (error) {
-      console.error('Camera activation error:', error);
-      
-      // Handle specific error types
-      if (error.name === 'NotAllowedError' || error.name === 'PermissionDeniedError') {
-        setCameraError('Camera access denied. Please grant permission to use your camera.');
-        setCameraPermission('denied');
-      } else if (error.name === 'NotFoundError' || error.name === 'DevicesNotFoundError') {
-        setCameraError('No camera found on your device.');
-        setHasCamera(false);
-      } else if (error.name === 'NotReadableError' || error.name === 'TrackStartError') {
-        setCameraError('Your camera is in use by another application.');
-      } else {
-        setCameraError('Failed to access camera: ' + error.message);
-      }
-      
-      setHasCamera(false);
-      setIsCameraActive(false);
-    }
-  };
-
-  const deactivateCamera = () => {
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach(track => track.stop());
-    }
-    setIsCameraActive(false);
-    setCapturedImage(null);
-    setPredictionResult(null);
-  };
-
-  const captureImage = useCallback(() => {
-    if (webcamRef.current) {
-      const imageSrc = webcamRef.current.getScreenshot();
-      // Convert base64 to blob
-      fetch(imageSrc)
-        .then(res => res.blob())
-        .then(blob => {
-          // Create File object with original format
-          const file = new File([blob], "captured-image.jpg", { type: blob.type });
-          console.log('Created file from capture:', file.name, file.type, file.size);
-          // Set captured image
-          setCapturedImage(URL.createObjectURL(file));
-          // Process the image
-          processImage(file);
-        })
-        .catch(error => {
-          console.error('Error converting image:', error);
-          setError('Failed to process captured image');
-        });
-    }
-  }, []);
-
-  const processImage = async (imageFile) => {
-    try {
-      setIsProcessing(true);
-      setError(null);
-
-      // Validate file before sending
-      if (!imageFile || !(imageFile instanceof File)) {
-        throw new Error('Invalid image file');
-      }
-
-      // Validate that it's an image file
-      if (!imageFile.type.startsWith('image/')) {
-        throw new Error('Please upload an image file');
-      }
-
-      // Create FormData and append the image with its original format
-      const formData = new FormData();
-      formData.append('image', imageFile);
-
-      console.log('Sending request to detect food:', API_ENDPOINTS.DETECT);
-      console.log('Image file being sent:', imageFile.name, imageFile.type, imageFile.size);
-      
-      let response;
-      try {
-        response = await fetch(API_ENDPOINTS.DETECT, {
-          method: 'POST',
-          body: formData
-        });
-
-        if (!response.ok) {
-          const errorText = await response.text();
-          console.error('Server error response:', errorText);
-          throw new Error(`Server error: ${errorText}`);
-        }
-
-        const responseData = await response.json();
-        console.log('Detection response:', responseData);
-
-        if (!responseData.predictions || responseData.predictions.length === 0) {
-          throw new Error('No food detected in the image');
-        }
-
-        // Display captured image
-        setCapturedImage(URL.createObjectURL(imageFile));
-
-        // Get all predictions sorted by confidence
-        const sortedPredictions = [...responseData.predictions].sort((a, b) => b.confidence - a.confidence);
-        const bestPrediction = sortedPredictions[0];
-
-        // Show warning for low confidence but continue processing
-        if (bestPrediction.confidence < 0.1) {
-          setError('Warning: Low confidence in food detection. Results may not be accurate.');
-        }
-
-        // Get nutrition data for the detected food
-        const foodName = bestPrediction.label;
-        console.log('Getting nutrition for:', foodName);
-        
-        const nutritionResponse = await fetch(API_ENDPOINTS.GET_NUTRITION, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json'
-          },
-          body: JSON.stringify({ 
-            food_name: foodName,
-            serving_size: 1
-          })
-        });
-
-        if (!nutritionResponse.ok) {
-          const nutritionError = await nutritionResponse.text();
-          console.error('Nutrition API error:', nutritionError);
-          throw new Error('Failed to get nutrition information');
-        }
-
-        const nutritionData = await nutritionResponse.json();
-        console.log('Nutrition data:', nutritionData);
-
-        // Create the final result object
-        const finalResult = {
-          predictions: sortedPredictions,
-          selectedFood: {
-            name: foodName,
-            confidence: bestPrediction.confidence
-          },
-          nutrition: nutritionData
-        };
-
-        // Always show the prediction result
-        setPredictionResult(finalResult);
-        setDetectedFood({
-          name: foodName,
-          confidence: bestPrediction.confidence,
-          nutrition: nutritionData
-        });
-
-        // Add to meal log if confidence is above 10%
-        if (bestPrediction.confidence >= 0.1) {
-          await handleAddMeal(finalResult);
-        }
-
-      } catch (fetchError) {
-        console.error('Fetch error:', fetchError);
-        throw fetchError;
-      }
-
-    } catch (error) {
-      console.error('Error processing image:', error);
-      setError(error.message || 'Failed to process image');
-      // Clear the captured image if there's an error
-      setCapturedImage(null);
-      setPredictionResult(null);
-      setDetectedFood(null);
-    } finally {
-      setIsProcessing(false);
-    }
-  };
-
-  const handleAddMeal = async (result) => {
-    if (!currentUser) {
-      console.error('No user logged in');
+    // Check if the status has actually changed
+    const statusStr = JSON.stringify(status);
+    if (lastWriteStatus === statusStr) {
+      pendingUpdates.clear();
       return;
     }
 
+    // Check if we've reached the maximum cached updates
+    if (pendingUpdates.size >= MAX_CACHED_UPDATES) {
+      // Force a write if we've cached too many updates
+      await processPendingUpdates(userId);
+      return;
+    }
+
+    // Check if enough time has passed since the last write
+    const now = Date.now();
+    if (now - lastWriteTime >= BATCH_UPDATE_DELAY) {
+      await processPendingUpdates(userId);
+      return;
+    }
+
+    // Set a new timeout to process the updates
+    pendingUpdates.timeout = setTimeout(async () => {
+      await processPendingUpdates(userId);
+    }, BATCH_UPDATE_DELAY);
+  };
+
+  const processPendingUpdates = async (userId) => {
     try {
-      const now = new Date();
-      const currentHour = now.getHours() + now.getMinutes() / 60;
-      const today = new Date().toISOString().split('T')[0];
+      if (pendingUpdates.size === 0) return;
+
+      const mealStatusRef = doc(db, 'userMealStatus', userId);
+      const updates = Array.from(pendingUpdates.entries()).reduce((acc, [key, status]) => {
+        const [_, date] = key.split('_');
+        acc[date] = status;
+        return acc;
+      }, {});
+
+      // Only write if there are actual changes
+      const currentStatus = localStorage.getItem(MEAL_STATUS_CACHE_KEY);
+      const updatesStr = JSON.stringify(updates);
       
-      // Determine meal type based on time
-      let mealType;
-      if (currentHour >= 6 && currentHour < 11) {
-        mealType = 'breakfast';
-      } else if (currentHour >= 11.5 && currentHour < 15) {
-        mealType = 'lunch';
-      } else if (currentHour >= 15.5 && currentHour < 19) {
-        mealType = 'snacks';
-      } else if (currentHour >= 19.5 || currentHour < 0) {
-        mealType = 'dinner';
-      } else {
-        mealType = 'snacks'; // Default to snacks for any other time
+      if (currentStatus === updatesStr) {
+        pendingUpdates.clear();
+        delete pendingUpdates.timeout;
+        return;
       }
 
-      console.log('Current hour:', currentHour, 'Meal type:', mealType);
+      // Update last write status before writing
+      lastWriteStatus = updatesStr;
 
-      // Get existing meals first
-      const userMealsRef = doc(db, 'userMeals', currentUser.uid);
-      const mealDoc = await getDoc(userMealsRef);
-      const existingData = mealDoc.exists() ? mealDoc.data() : {};
-      const todaysMealArray = existingData[today] || [];
-
-      // Create new meal data
-      const mealData = {
-        foodItems: [result.selectedFood.name],
-        timestamp: new Date().toISOString(),
-        mealType: mealType,
-        nutrition: result.nutrition,
-        confidence: result.selectedFood.confidence
-      };
-
-      // Update Firestore with new meal
-      await setDoc(userMealsRef, {
-        ...existingData,
-        [today]: [...todaysMealArray, mealData]
-      });
-
-      // Update progress in Firestore
-      const progressRef = doc(db, 'userProgress', currentUser.uid);
-      const progressDoc = await getDoc(progressRef);
-      const currentProgress = progressDoc.exists() ? (progressDoc.data()[today] || {}) : {};
-
-      const updatedProgress = {
-        calories: (currentProgress.calories || 0) + result.nutrition.calories,
-        protein: (currentProgress.protein || 0) + result.nutrition.protein,
-        carbs: (currentProgress.carbs || 0) + result.nutrition.carbs,
-        fats: (currentProgress.fats || 0) + result.nutrition.fats,
-        lastUpdated: new Date().toISOString()
-      };
-
-      await setDoc(progressRef, {
-        [today]: updatedProgress
+      await setDoc(mealStatusRef, {
+        userId,
+        updatedAt: serverTimestamp(),
+        mealStatus: updates
       }, { merge: true });
 
-      // Update local state with accumulated values
-      const updatedMeals = { ...todaysMeals };
-      if (!updatedMeals[mealType]) {
-        updatedMeals[mealType] = {
-          calories: 0,
-          protein: 0,
-          carbs: 0,
-          fats: 0
-        };
-      }
-      updatedMeals[mealType].calories += result.nutrition.calories;
-      updatedMeals[mealType].protein += result.nutrition.protein;
-      updatedMeals[mealType].carbs += result.nutrition.carbs;
-      updatedMeals[mealType].fats += result.nutrition.fats;
+      // Update last write time
+      lastWriteTime = Date.now();
 
-      setTodaysMeals(updatedMeals);
-      updateMealStatus(updatedMeals);
+      // Clear the pending updates
+      pendingUpdates.clear();
+      delete pendingUpdates.timeout;
 
-      // Don't clear states immediately
-      setTimeout(() => {
-        setCapturedImage(null);
-        setPredictionResult(null);
-        setDetectedFood(null);
-        setError(null);
-        deactivateCamera();
-      }, 5000); // Show result for 5 seconds
-
-      console.log('Meal logged successfully with type:', mealType);
-
-    } catch (err) {
-      console.error('Error logging meal:', err);
-      setError('Failed to log meal. Please try again.');
+      // Update local cache
+      localStorage.setItem(MEAL_STATUS_CACHE_KEY, updatesStr);
+    } catch (error) {
+      console.error('Error processing pending updates:', error);
+      // Keep the updates in the pending map if the write fails
     }
   };
 
@@ -1037,162 +964,105 @@ const Dashboard = () => {
   );
 
   const renderDailyTargets = () => {
-    if (!dietPlan?.recommendations?.dailyTargets) {
-      return (
-        <Box sx={{ p: 3, textAlign: 'center' }}>
-          <CircularProgress />
-          <Typography sx={{ mt: 2 }}>Loading daily targets...</Typography>
-        </Box>
-      );
-    }
-
-    const mealType = MEAL_ORDER[activeTargetIndex];
-    const targets = {
-      calories: 520,
-      protein: 30,
-      carbs: 65,
-      fats: 15
-    };
-    
-    // Get the accumulated values for this meal type
-    const meal = todaysMeals[mealType] || { calories: 0, protein: 0, carbs: 0, fats: 0 };
-    
-    // Calculate progress percentages
-    const progress = {
-      calories: (meal.calories / targets.calories) * 100 || 0,
-      protein: (meal.protein / targets.protein) * 100 || 0,
-      carbs: (meal.carbs / targets.carbs) * 100 || 0,
-      fats: (meal.fats / targets.fats) * 100 || 0,
-    };
+    const currentMealType = MEAL_ORDER[activeTargetIndex];
+    const mealTargets = dailyTargets[currentMealType] || { calories: 0, protein: 0, carbs: 0, fats: 0 };
+    const mealProgress = todaysMeals[currentMealType] || { calories: 0, protein: 0, carbs: 0, fats: 0 };
 
     return (
-      <Box sx={{ position: 'relative', width: '100%' }}>
-        <Typography variant="h6" gutterBottom>
-          Daily Targets
-        </Typography>
-        
-        <Box sx={{ position: 'relative', minHeight: '300px', width: '100%' }}>
-          <Card sx={{ width: '100%', p: 2 }}>
-            <Stack spacing={3} sx={{ width: '100%' }}>
-              <Stack direction="row" justifyContent="space-between" alignItems="center">
-                <Typography variant="h6" color="primary">
-                  {mealType.charAt(0).toUpperCase() + mealType.slice(1)}
-                </Typography>
-                <Typography variant="body2" color="text.secondary">
-                  {MEAL_TIMES[activeTargetIndex].time}
-                </Typography>
-              </Stack>
+      <Card sx={{ height: '100%' }}>
+        <CardContent>
+          <Stack direction="row" alignItems="center" justifyContent="space-between" mb={2}>
+            <Typography variant="h6">
+              {currentMealType.charAt(0).toUpperCase() + currentMealType.slice(1)} Targets
+            </Typography>
+            <Stack direction="row" spacing={1}>
+              <IconButton onClick={handlePrevTarget} size="small">
+                <ChevronLeftIcon />
+              </IconButton>
+              <IconButton onClick={handleNextTarget} size="small">
+                <ChevronRightIcon />
+              </IconButton>
+            </Stack>
+          </Stack>
 
-              <Stack spacing={2.5} sx={{ width: '100%' }}>
-                <Box sx={{ width: '100%' }}>
-                  <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: 1 }}>
-                    <Typography variant="body2">Calories</Typography>
-                    <Typography variant="body2">{Math.round(meal.calories)}/{targets.calories} kcal</Typography>
-                  </Stack>
-                  <LinearProgress 
-                    variant="determinate" 
-                    value={Math.min(progress.calories, 100)}
-                    sx={{ height: 8, borderRadius: 4, width: '100%' }}
+          <Grid container spacing={2}>
+            <Grid item xs={12}>
+              <Typography variant="subtitle2" color="text.secondary">
+                Calories
+              </Typography>
+              <Stack direction="row" alignItems="center" spacing={1}>
+                <Box sx={{ flexGrow: 1 }}>
+                  <LinearProgress
+                    variant="determinate"
+                    value={Math.min((mealProgress.calories / mealTargets.calories) * 100, 100)}
+                    sx={{ height: 10, borderRadius: 5 }}
                   />
                 </Box>
+                <Typography variant="body2" color="text.secondary">
+                  {mealProgress.calories}/{mealTargets.calories}
+                </Typography>
+              </Stack>
+            </Grid>
 
-                <Box sx={{ width: '100%' }}>
-                  <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: 1 }}>
-                    <Typography variant="body2">Protein</Typography>
-                    <Typography variant="body2">{Math.round(meal.protein)}/{targets.protein}g</Typography>
-                  </Stack>
-                  <LinearProgress 
-                    variant="determinate" 
-                    value={Math.min(progress.protein, 100)}
-                    sx={{ height: 8, borderRadius: 4, width: '100%' }}
+            <Grid item xs={12}>
+              <Typography variant="subtitle2" color="text.secondary">
+                Protein
+              </Typography>
+              <Stack direction="row" alignItems="center" spacing={1}>
+                <Box sx={{ flexGrow: 1 }}>
+                  <LinearProgress
+                    variant="determinate"
+                    value={Math.min((mealProgress.protein / mealTargets.protein) * 100, 100)}
+                    sx={{ height: 10, borderRadius: 5 }}
                     color="success"
                   />
                 </Box>
+                <Typography variant="body2" color="text.secondary">
+                  {mealProgress.protein}/{mealTargets.protein}g
+                </Typography>
+              </Stack>
+            </Grid>
 
-                <Box sx={{ width: '100%' }}>
-                  <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: 1 }}>
-                    <Typography variant="body2">Carbs</Typography>
-                    <Typography variant="body2">{Math.round(meal.carbs)}/{targets.carbs}g</Typography>
-                  </Stack>
-                  <LinearProgress 
-                    variant="determinate" 
-                    value={Math.min(progress.carbs, 100)}
-                    sx={{ height: 8, borderRadius: 4, width: '100%' }}
+            <Grid item xs={12}>
+              <Typography variant="subtitle2" color="text.secondary">
+                Carbs
+              </Typography>
+              <Stack direction="row" alignItems="center" spacing={1}>
+                <Box sx={{ flexGrow: 1 }}>
+                  <LinearProgress
+                    variant="determinate"
+                    value={Math.min((mealProgress.carbs / mealTargets.carbs) * 100, 100)}
+                    sx={{ height: 10, borderRadius: 5 }}
                     color="warning"
                   />
                 </Box>
+                <Typography variant="body2" color="text.secondary">
+                  {mealProgress.carbs}/{mealTargets.carbs}g
+                </Typography>
+              </Stack>
+            </Grid>
 
-                <Box sx={{ width: '100%' }}>
-                  <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: 1 }}>
-                    <Typography variant="body2">Fats</Typography>
-                    <Typography variant="body2">{Math.round(meal.fats)}/{targets.fats}g</Typography>
-                  </Stack>
-                  <LinearProgress 
-                    variant="determinate" 
-                    value={Math.min(progress.fats, 100)}
-                    sx={{ height: 8, borderRadius: 4, width: '100%' }}
+            <Grid item xs={12}>
+              <Typography variant="subtitle2" color="text.secondary">
+                Fats
+              </Typography>
+              <Stack direction="row" alignItems="center" spacing={1}>
+                <Box sx={{ flexGrow: 1 }}>
+                  <LinearProgress
+                    variant="determinate"
+                    value={Math.min((mealProgress.fats / mealTargets.fats) * 100, 100)}
+                    sx={{ height: 10, borderRadius: 5 }}
                     color="error"
                   />
                 </Box>
+                <Typography variant="body2" color="text.secondary">
+                  {mealProgress.fats}/{mealTargets.fats}g
+                </Typography>
               </Stack>
-            </Stack>
-          </Card>
-
-          {/* Navigation Controls */}
-          <Stack
-            direction="row"
-            spacing={2}
-            justifyContent="center"
-            alignItems="center"
-            sx={{ mt: 2 }}
-          >
-            <IconButton
-              onClick={handlePrevTarget}
-              size="small"
-              sx={{
-                bgcolor: 'background.paper',
-                boxShadow: 1,
-                '&:hover': { bgcolor: 'grey.100' }
-              }}
-            >
-              <ChevronLeftIcon />
-            </IconButton>
-
-            <Stack
-              direction="row"
-              spacing={1}
-              alignItems="center"
-            >
-              {MEAL_ORDER.map((_, index) => (
-                <Box
-                  key={index}
-                  onClick={() => setActiveTargetIndex(index)}
-                  sx={{
-                    width: 8,
-                    height: 8,
-                    borderRadius: '50%',
-                    bgcolor: index === activeTargetIndex ? 'primary.main' : 'grey.300',
-                    cursor: 'pointer',
-                    transition: 'all 0.3s'
-                  }}
-                />
-              ))}
-            </Stack>
-
-            <IconButton
-              onClick={handleNextTarget}
-              size="small"
-              sx={{
-                bgcolor: 'background.paper',
-                boxShadow: 1,
-                '&:hover': { bgcolor: 'grey.100' }
-              }}
-            >
-              <ChevronRightIcon />
-            </IconButton>
-          </Stack>
-        </Box>
-      </Box>
+            </Grid>
+          </Grid>
+        </CardContent>
+      </Card>
     );
   };
 
@@ -1243,13 +1113,10 @@ const Dashboard = () => {
       const today = new Date().toISOString().split('T')[0];
       const hour = new Date().getHours();
 
-      // Only check after dinner time (after 12 AM)
       if (hour < 0) return;
 
-      // Check if all meals are completed
       const allMealsCompleted = MEAL_ORDER.every(meal => mealStatus[meal]);
       
-      // Get current streak from Firestore
       const streakRef = doc(db, 'userStreaks', userId);
       let streakDoc;
       
@@ -1257,7 +1124,6 @@ const Dashboard = () => {
         streakDoc = await getDoc(streakRef);
       } catch (error) {
         console.error('Error reading streak document:', error);
-        // Initialize with default values if read fails
         streakDoc = { exists: () => false };
       }
       
@@ -1270,7 +1136,6 @@ const Dashboard = () => {
         history = data.history || {};
       }
 
-      // Update streak and history
       if (allMealsCompleted) {
         currentStreak += 1;
         history[today] = true;
@@ -1279,7 +1144,6 @@ const Dashboard = () => {
         history[today] = false;
       }
 
-      // Try to update Firestore
       try {
         await setDoc(streakRef, {
           currentStreak,
@@ -1288,103 +1152,238 @@ const Dashboard = () => {
           userId
         });
 
-        // Only update local state if Firestore update succeeds
         setStreak(currentStreak);
         setDietHistory(history);
       } catch (error) {
         console.error('Error updating streak document:', error);
-        // Continue without crashing if update fails
       }
 
     } catch (error) {
       console.error('Error in checkAndUpdateStreak:', error);
-      // Continue without crashing
     }
   };
 
-  // Add this useEffect to fetch historical streak data
-  useEffect(() => {
-    const fetchHistoricalStreakData = async () => {
-      if (!currentUser) return;
+  const fetchHistoricalStreakData = async () => {
+    if (!currentUser) return;
 
-      try {
-        // Get all progress data
-        const progressRef = doc(db, 'userProgress', currentUser.uid);
-        const progressDoc = await getDoc(progressRef);
-        const progressData = progressDoc.data() || {};
-
-        const completed = [];
-        const missed = [];
-
-        // Process each date in the progress data
-        Object.entries(progressData).forEach(([date, data]) => {
-          // Skip if not a date entry
-          if (date === 'dailyProgress' || date === 'userId' || date === 'createdAt' || !data) return;
-
-          // Check if the date has valid nutrition values
-          if (data.calories > 0 && data.protein > 0 && data.carbs > 0 && data.fats > 0) {
-            completed.push(date);
-          } else {
-            missed.push(date);
-          }
-        });
-
-        console.log('Setting completed dates:', completed);
-        console.log('Setting missed dates:', missed);
-        
-        setCompletedDates(completed);
-        setMissedDates(missed);
-      } catch (error) {
-        console.error('Error fetching historical streak data:', error);
-      }
-    };
-
-    fetchHistoricalStreakData();
-  }, [currentUser]);
-
-  // Add this function at the top level of the component
-  const fetchHistoricalData = async (userId) => {
     try {
-      // Get all meals data
-      const mealsRef = doc(db, 'userMeals', userId);
-      const mealsDoc = await getDoc(mealsRef);
-      const mealsData = mealsDoc.data() || {};
-
-      // Get all progress data
-      const progressRef = doc(db, 'userProgress', userId);
+      const progressRef = doc(db, 'userProgress', currentUser.uid);
       const progressDoc = await getDoc(progressRef);
       const progressData = progressDoc.data() || {};
 
       const completed = [];
       const missed = [];
+      
+      const dateRegex = /^\d{4}-\d{2}-\d{2}$/;
 
-      // Process each date
       Object.entries(progressData).forEach(([date, data]) => {
-        // Skip non-date entries
-        if (date === 'dailyProgress' || date === 'userId' || date === 'createdAt' || !data) return;
+        if (!dateRegex.test(date) || 
+            date === 'dailyProgress' || 
+            date === 'userId' || 
+            date === 'createdAt' || 
+            !data) return;
 
-        // Get meals for this date
-        const mealsForDate = mealsData[date] || [];
-        const mealTypes = new Set(mealsForDate.map(meal => meal.mealType));
-
-        // Check if all required meals are present and have nutrition values
-        if (data.calories > 0 && data.protein > 0 && data.carbs > 0 && data.fats > 0 && mealTypes.size >= 3) {
+        if (data.calories > 0 && data.protein > 0 && data.carbs > 0 && data.fats > 0) {
           completed.push(date);
-          console.log('Marked as completed:', date);
         } else {
           missed.push(date);
-          console.log('Marked as missed:', date);
         }
       });
 
-      console.log('Completed dates:', completed);
-      console.log('Missed dates:', missed);
+      const uniqueCompleted = Array.from(new Set(completed))
+        .filter(date => dateRegex.test(date))
+        .sort();
+        
+      const uniqueMissed = Array.from(new Set(missed))
+        .filter(date => dateRegex.test(date))
+        .sort();
 
+      const currentStreak = calculateStreak(uniqueCompleted, today);
+
+      await setDoc(streakRef, {
+        currentStreak,
+        history: Object.fromEntries(uniqueCompleted.map(date => [date, true])),
+        lastUpdated: new Date().toISOString()
+      }, { merge: true });
+
+      setStreak(currentStreak);
+      
+      return { completed: uniqueCompleted, missed: uniqueMissed };
+    } catch (error) {
+      console.error('Error fetching historical data:', error);
+      return { completed: [], missed: [] };
+    }
+  };
+
+  useEffect(() => {
+    const fetchStreakOnMount = async () => {
+      if (!auth.currentUser) return;
+      
+      try {
+        const userId = auth.currentUser.uid;
+        const streakRef = doc(db, 'userStreaks', userId);
+        const streakDoc = await getDoc(streakRef);
+        
+        if (streakDoc.exists()) {
+          const data = streakDoc.data();
+          setStreak(data.currentStreak || 0);
+        } else {
+          setStreak(0);
+        }
+      } catch (error) {
+        console.error('Error fetching streak on mount:', error);
+      }
+    };
+    
+    fetchStreakOnMount();
+  }, []);
+
+  const recalculateStreak = async () => {
+    try {
+      if (!auth.currentUser) return;
+      
+      const userId = auth.currentUser.uid;
+      const today = new Date().toISOString().split('T')[0];
+      
+      const streakRef = doc(db, 'userStreaks', userId);
+      const streakDoc = await getDoc(streakRef);
+      
+      if (!streakDoc.exists()) return;
+      
+      const data = streakDoc.data();
+      const completedDates = Object.entries(data.history || {})
+        .filter(([_, isCompleted]) => isCompleted)
+        .map(([date]) => date);
+      
+      // Update streak in Firestore and get new streak value
+      const newStreak = await updateStreakInFirestore(userId, completedDates, today);
+      
+      // Update local state
+      setStreak(newStreak);
+    } catch (error) {
+      console.error('Error recalculating streak:', error);
+    }
+  };
+
+  useEffect(() => {
+    const fetchStreakOnMount = async () => {
+      if (!auth.currentUser) return;
+      
+      try {
+        const userId = auth.currentUser.uid;
+        const streakRef = doc(db, 'userStreaks', userId);
+        const streakDoc = await getDoc(streakRef);
+        
+        if (streakDoc.exists()) {
+          const data = streakDoc.data();
+          setStreak(data.currentStreak || 0);
+        } else {
+          setStreak(0);
+        }
+      } catch (error) {
+        console.error('Error fetching streak on mount:', error);
+      }
+    };
+    
+    fetchStreakOnMount();
+  }, []);
+
+  // Add this function at the top level of the component
+  const fetchHistoricalData = async (userId) => {
+    try {
+      const today = new Date().toISOString().split('T')[0];
+      const streakRef = doc(db, 'userStreaks', userId);
+      const streakDoc = await getDoc(streakRef);
+      
+      let completed = [];
+      let missed = [];
+      
+      if (streakDoc.exists()) {
+        const data = streakDoc.data();
+        const history = data.history || {};
+        
+        // Process all dates up to today
+        const currentDate = new Date();
+        currentDate.setHours(0, 0, 0, 0);
+        
+        Object.entries(history).forEach(([date, status]) => {
+          const entryDate = new Date(date);
+          // Only process dates up to today
+          if (entryDate <= currentDate) {
+            if (status === true) {
+              completed.push(date);
+            } else {
+              missed.push(date);
+            }
+          }
+        });
+        
+        // Sort the arrays
+        completed.sort();
+        missed.sort();
+      }
+      
       return { completed, missed };
     } catch (error) {
       console.error('Error fetching historical data:', error);
       return { completed: [], missed: [] };
     }
+  };
+
+  // Helper function to calculate streak consistently
+  const calculateStreak = (history) => {
+    if (!history || Object.keys(history).length === 0) return 0;
+    
+    // Get all dates and sort them in descending order (most recent first)
+    const dates = Object.entries(history)
+      .filter(([_, completed]) => completed === true)
+      .map(([date]) => date)
+      .sort((a, b) => b.localeCompare(a));
+    
+    if (dates.length === 0) return 0;
+    
+    let streak = 0;
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    
+    // Convert today to YYYY-MM-DD format
+    const todayStr = today.toISOString().split('T')[0];
+    
+    // Start checking from the most recent date
+    for (let i = 0; i < dates.length; i++) {
+      const currentDate = new Date(dates[i]);
+      currentDate.setHours(0, 0, 0, 0);
+      
+      // If we're checking the first date
+      if (i === 0) {
+        // If the most recent completion is not from today or yesterday, break
+        const daysDiff = Math.floor((today - currentDate) / (1000 * 60 * 60 * 24));
+        if (daysDiff > 1) break;
+        streak = 1;
+        continue;
+      }
+      
+      // Get the previous date to check for consecutive days
+      const prevDate = new Date(dates[i - 1]);
+      prevDate.setHours(0, 0, 0, 0);
+      
+      // Check if dates are consecutive
+      const daysDiff = Math.floor((prevDate - currentDate) / (1000 * 60 * 60 * 24));
+      if (daysDiff === 1) {
+        streak++;
+      } else {
+        break;
+      }
+    }
+    
+    return streak;
+  };
+
+  // Helper function to check if a date is yesterday
+  const isYesterday = (date) => {
+    const yesterday = new Date();
+    yesterday.setDate(yesterday.getDate() - 1);
+    return date.toDateString() === yesterday.toDateString();
   };
 
   // Update the useEffect that handles user authentication
@@ -1396,6 +1395,9 @@ const Dashboard = () => {
       }
 
       try {
+        // Clean up old data before loading new data
+        cleanupOldData();
+        
         // Fetch historical data
         const { completed, missed } = await fetchHistoricalData(user.uid);
         setCompletedDates(completed);
@@ -1435,111 +1437,1056 @@ const Dashboard = () => {
   }, [navigate]);
 
   // Update the renderDay function
-  const renderDay = (day) => {
-    const dateStr = day.toISOString().split('T')[0];
-    const isToday = dateStr === new Date().toISOString().split('T')[0];
+  const renderDay = (date, selectedDates, dayInCurrentMonth) => {
+    if (!dayInCurrentMonth) return <div>{date.getDate()}</div>;
+    
+    const dateStr = date.toISOString().split('T')[0];
     const isCompleted = completedDates.includes(dateStr);
     const isMissed = missedDates.includes(dateStr);
     
-    // Debug logs
-    if (isCompleted || isMissed) {
-      console.log('Rendering date:', dateStr, { isCompleted, isMissed });
-    }
-
     return (
       <Box
-        key={dateStr}
         sx={{
           position: 'relative',
-          height: '40px',
+          width: '100%',
+          height: '100%',
           display: 'flex',
           alignItems: 'center',
           justifyContent: 'center',
-          '&::after': {
-            content: '""',
-            position: 'absolute',
-            bottom: 0,
-            left: '10%',
-            right: '10%',
-            height: '3px',
-            backgroundColor: isCompleted ? '#4CAF50' : isMissed ? '#f44336' : 'transparent'
-          }
+          ...(isCompleted && {
+            bgcolor: 'success.main',
+            color: 'white',
+            borderRadius: '50%'
+          }),
+          ...(isMissed && {
+            bgcolor: 'error.main',
+            color: 'white',
+            borderRadius: '50%'
+          })
         }}
       >
-        <Typography 
-          variant="body2" 
-          align="center"
-          sx={{
-            color: isToday ? 'primary.main' : 'text.primary',
-            fontWeight: isToday ? 'bold' : 'normal'
-          }}
-        >
-          {day.getDate()}
-        </Typography>
+        {date.getDate()}
       </Box>
     );
   };
 
   const renderPredictionResult = () => {
-    if (!predictionResult || !detectedFood) return null;
+    if (!detectedFood) return null;
+
+    // Log the detected food data to verify values
+    console.log('Rendering prediction result with data:', detectedFood);
 
     return (
-      <Box sx={{ mt: 2 }}>
+      <Box sx={{ mt: 2, p: 2, bgcolor: 'background.paper', borderRadius: 1 }}>
         {error && (
-          <Alert 
-            severity={error.includes('Warning:') ? 'warning' : 'error'}
-            sx={{ mb: 2 }}
-          >
+          <Alert severity="error" sx={{ mb: 2 }}>
             {error}
           </Alert>
         )}
+        
         <Typography variant="h6" gutterBottom>
-          Detected Food: {detectedFood.name}
+          Detected Food: {detectedFood.name || detectedFood.foodName}
         </Typography>
-        <Typography variant="body2" gutterBottom color="text.secondary">
-          Confidence: {(detectedFood.confidence * 100).toFixed(1)}%
+
+        <Typography variant="h6" gutterBottom>
+          Nutrition Information:
         </Typography>
-        <Grid container spacing={2} sx={{ mt: 1 }}>
+        <Grid container spacing={2}>
           <Grid item xs={3}>
-            <Typography variant="body2" color="text.secondary">Calories</Typography>
-            <Typography variant="h6">{detectedFood.nutrition.calories}</Typography>
+            <Box sx={{ textAlign: 'center', p: 1, bgcolor: 'primary.light', borderRadius: 1 }}>
+              <Typography variant="body2" color="text.secondary">Calories</Typography>
+              <Typography variant="h6">{Math.round(detectedFood?.nutrition?.calories) || 0}</Typography>
+            </Box>
           </Grid>
           <Grid item xs={3}>
-            <Typography variant="body2" color="text.secondary">Protein</Typography>
-            <Typography variant="h6">{detectedFood.nutrition.protein}g</Typography>
+            <Box sx={{ textAlign: 'center', p: 1, bgcolor: 'success.light', borderRadius: 1 }}>
+              <Typography variant="body2" color="text.secondary">Protein</Typography>
+              <Typography variant="h6">{Math.round(detectedFood?.nutrition?.protein) || 0}g</Typography>
+            </Box>
           </Grid>
           <Grid item xs={3}>
-            <Typography variant="body2" color="text.secondary">Carbs</Typography>
-            <Typography variant="h6">{detectedFood.nutrition.carbs}g</Typography>
+            <Box sx={{ textAlign: 'center', p: 1, bgcolor: 'warning.light', borderRadius: 1 }}>
+              <Typography variant="body2" color="text.secondary">Carbs</Typography>
+              <Typography variant="h6">{Math.round(detectedFood?.nutrition?.carbs) || 0}g</Typography>
+            </Box>
           </Grid>
           <Grid item xs={3}>
-            <Typography variant="body2" color="text.secondary">Fats</Typography>
-            <Typography variant="h6">{detectedFood.nutrition.fats}g</Typography>
+            <Box sx={{ textAlign: 'center', p: 1, bgcolor: 'error.light', borderRadius: 1 }}>
+              <Typography variant="body2" color="text.secondary">Fats</Typography>
+              <Typography variant="h6">{Math.round(detectedFood?.nutrition?.fats) || 0}g</Typography>
+            </Box>
           </Grid>
         </Grid>
       </Box>
     );
   };
 
-  if (loading) {
-    return (
-      <Box display="flex" justifyContent="center" alignItems="center" minHeight="80vh">
-        <CircularProgress />
-      </Box>
-    );
-  }
+  const determineMealTypeByHour = (hour) => {
+    // Breakfast: 6 AM - 11 AM
+    if (hour >= 6 && hour < 11) return 'breakfast';
+    // Lunch: 11:30 AM - 3 PM
+    if (hour >= 11.5 && hour < 15) return 'lunch';
+    // Snacks: 3:30 PM - 7 PM
+    if (hour >= 15.5 && hour < 19) return 'snacks';
+    // Dinner: 7:30 PM - 12 AM
+    if (hour >= 19.5 || hour < 0) return 'dinner';
+    // All other times (12 AM - 5:59 AM, 11:00 AM - 11:29 AM, 3:00 PM - 3:29 PM, 7:00 PM - 7:29 PM) are snacks
+    return 'snacks';
+  };
 
-  if (error) {
-    return (
-      <Container sx={{ mt: 4 }}>
-        <Alert severity="error" sx={{ mb: 2 }}>{error}</Alert>
-        <Button variant="contained" onClick={() => setError(null)}>
-          Try Again
-        </Button>
-      </Container>
-    );
-  }
+  // New function to migrate meals from userProgress to userMeals
+  const migrateMealsFromProgress = async (userId) => {
+    if (migrationCompletedRef.current) return;
+    
+    try {
+      console.log('Starting migration of meals from userProgress to userMeals');
+      
+      // Get data from userProgress
+      const progressRef = doc(db, 'userProgress', userId);
+      const progressDoc = await getDoc(progressRef);
+      
+      if (!progressDoc.exists()) {
+        console.log('No userProgress data to migrate');
+        return;
+      }
+      
+      const progressData = progressDoc.data();
+      console.log('Progress data from Firestore:', progressData);
+      
+      // Get current userMeals data
+      const mealsRef = doc(db, 'userMeals', userId);
+      const mealsDoc = await getDoc(mealsRef);
+      const mealsData = mealsDoc.exists() ? mealsDoc.data() : {};
+      console.log('Current meals data from Firestore:', mealsData);
+      
+      let migratedCount = 0;
+      let skippedCount = 0;
+      
+      // Process each date in progressData
+      for (const [date, dateData] of Object.entries(progressData)) {
+        // Skip keys that are not dates
+        if (!date.match(/^\d{4}-\d{2}-\d{2}$/)) {
+          console.log(`Skipping non-date key: ${date}`);
+          continue;
+        }
+        
+        console.log(`Processing date: ${date}, data:`, dateData);
+        
+        // Initialize the meals array for this date if it doesn't exist
+        if (!mealsData[date]) {
+          mealsData[date] = [];
+        }
+        
+        // Create a set of identifiers for existing meals to detect duplicates
+        // Use a composite key of foodName + mealType + timestamp + calories as a fingerprint
+        const existingMealSignatures = new Set();
+        mealsData[date].forEach(meal => {
+          // Create a unique signature for the meal
+          const foodName = meal.foodName || meal.name || 'Unknown';
+          const mealType = meal.mealType || 'snacks';
+          const timestamp = meal.timestamp ? meal.timestamp.toString().substring(0, 16) : '';
+          const calories = meal.nutrition?.calories || 0;
+          
+          const signature = `${foodName}-${mealType}-${timestamp}-${calories}`;
+          existingMealSignatures.add(signature);
+          
+          // Also add without timestamp as some migrated meals might not have exact same timestamp
+          const signatureNoTime = `${foodName}-${mealType}-${calories}`;
+          existingMealSignatures.add(signatureNoTime);
+        });
+        
+        // Case 1: If dateData has a 'meals' array property
+        if (Array.isArray(dateData.meals) && dateData.meals.length > 0) {
+          console.log(`Found ${dateData.meals.length} meals in userProgress for ${date}`);
+          
+          dateData.meals.forEach(meal => {
+            // Skip if we already have this meal by checking signature
+            const foodName = meal.foodName || meal.name || 'Unknown Food';
+            const mealType = meal.mealType || 'snacks';
+            const timestamp = meal.timestamp ? meal.timestamp.toString().substring(0, 16) : '';
+            const calories = meal.nutrition?.calories || 0;
+            
+            const signature = `${foodName}-${mealType}-${timestamp}-${calories}`;
+            const signatureNoTime = `${foodName}-${mealType}-${calories}`;
+            
+            if (existingMealSignatures.has(signature) || existingMealSignatures.has(signatureNoTime)) {
+              console.log(`Skipping duplicate meal: ${foodName}`);
+              skippedCount++;
+              return;
+            }
+            
+            // Only add if it has necessary data
+            if (meal && (meal.nutrition || meal.foodName)) {
+              // Determine meal type based on timestamp if not specified
+              let mealType = meal.mealType;
+              if (!mealType && meal.timestamp) {
+                try {
+                  const mealTime = new Date(meal.timestamp);
+                  const hour = mealTime.getHours() + mealTime.getMinutes() / 60;
+                  mealType = determineMealTypeByHour(hour);
+                } catch (e) {
+                  console.error('Error determining meal type from timestamp:', e);
+                  mealType = 'snacks'; // Default
+                }
+              }
+              
+              const newMeal = {
+                foodName: foodName,
+                name: foodName,
+                nutrition: meal.nutrition || {
+                  calories: 0,
+                  protein: 0,
+                  carbs: 0,
+                  fats: 0
+                },
+                mealType: mealType || 'snacks',
+                timestamp: meal.timestamp || new Date().toISOString()
+              };
+              
+              mealsData[date].push(newMeal);
+              
+              // Add the signature to the set to prevent duplicates in the same run
+              existingMealSignatures.add(signature);
+              existingMealSignatures.add(signatureNoTime);
+              
+              console.log(`Migrated meal: ${foodName} as ${mealType}`);
+              migratedCount++;
+            }
+          });
+        } 
+        // Case 2: Check direct mealType objects in the date data
+        else if (dateData.breakfast || dateData.lunch || dateData.dinner || dateData.snacks) {
+          console.log(`Found direct meal type objects for ${date}`);
+          
+          // Process each meal type
+          const mealTypes = ['breakfast', 'lunch', 'dinner', 'snacks'];
+          
+          mealTypes.forEach(mealType => {
+            if (dateData[mealType]) {
+              const mealData = dateData[mealType];
+              
+              // Create a timestamp for this meal based on typical meal times
+              let mealHour;
+              switch(mealType) {
+                case 'breakfast': mealHour = 8; break; // 8 AM
+                case 'lunch': mealHour = 13; break;    // 1 PM
+                case 'dinner': mealHour = 19; break;   // 7 PM
+                case 'snacks': mealHour = 16; break;   // 4 PM
+                default: mealHour = 12;                // Noon
+              }
+              
+              const mealDate = new Date(date);
+              mealDate.setHours(mealHour, 0, 0, 0);
+              const timestamp = mealDate.toISOString();
+              
+              // Create the foodName
+              const foodName = `${mealType.charAt(0).toUpperCase() + mealType.slice(1)} meal`;
+              
+              // Get nutrition
+              const nutrition = typeof mealData === 'object' && mealData.nutrition ? mealData.nutrition : {
+                calories: typeof mealData === 'object' ? (mealData.calories || 0) : 0,
+                protein: typeof mealData === 'object' ? (mealData.protein || 0) : 0,
+                carbs: typeof mealData === 'object' ? (mealData.carbs || 0) : 0,
+                fats: typeof mealData === 'object' ? (mealData.fats || 0) : 0
+              };
+              
+              // Create signatures
+              const calories = nutrition.calories || 0;
+              const signature = `${foodName}-${mealType}-${timestamp.substring(0, 16)}-${calories}`;
+              const signatureNoTime = `${foodName}-${mealType}-${calories}`;
+              
+              // Check if this meal already exists
+              if (existingMealSignatures.has(signature) || existingMealSignatures.has(signatureNoTime)) {
+                console.log(`Skipping duplicate meal type: ${mealType}`);
+                skippedCount++;
+                return;
+              }
+              
+              const newMeal = {
+                foodName: foodName,
+                name: foodName,
+                nutrition: nutrition,
+                mealType: mealType,
+                timestamp: timestamp
+              };
+              
+              mealsData[date].push(newMeal);
+              
+              // Add the signature to the set to prevent duplicates in the same run
+              existingMealSignatures.add(signature);
+              existingMealSignatures.add(signatureNoTime);
+              
+              console.log(`Migrated ${mealType} meal for ${date}`);
+              migratedCount++;
+            }
+          });
+        }
+        // Case 3: If the date has calories, protein, etc. directly (no meals array)
+        else if (dateData.calories !== undefined || dateData.protein !== undefined || 
+                 dateData.carbs !== undefined || dateData.fats !== undefined) {
+          
+          // Distribute nutrition data across different meal types based on typical proportions
+          const mealDistribution = {
+            breakfast: 0.25,
+            lunch: 0.35,
+            dinner: 0.30,
+            snacks: 0.10
+          };
+          
+          // Check if any of these meal types already exist
+          let hasExistingMeals = mealsData[date].length > 0;
+          
+          // Only create these entries if we don't already have meals for this date
+          if (!hasExistingMeals) {
+            console.log(`Found total nutrition data for ${date}, distributing across meal types`);
+            
+            for (const [mealType, proportion] of Object.entries(mealDistribution)) {
+              // Create a timestamp for this meal
+              let mealHour;
+              switch(mealType) {
+                case 'breakfast': mealHour = 8; break; // 8 AM
+                case 'lunch': mealHour = 13; break;    // 1 PM
+                case 'dinner': mealHour = 19; break;   // 7 PM
+                case 'snacks': mealHour = 16; break;   // 4 PM
+                default: mealHour = 12;                // Noon
+              }
+              
+              const mealDate = new Date(date);
+              mealDate.setHours(mealHour, 0, 0, 0);
+              const timestamp = mealDate.toISOString();
+              
+              const foodName = `${mealType.charAt(0).toUpperCase() + mealType.slice(1)} meal`;
+              const calories = Math.round((dateData.calories || 0) * proportion);
+              
+              // Create signatures
+              const signature = `${foodName}-${mealType}-${timestamp.substring(0, 16)}-${calories}`;
+              const signatureNoTime = `${foodName}-${mealType}-${calories}`;
+              
+              // Check if this meal already exists
+              if (existingMealSignatures.has(signature) || existingMealSignatures.has(signatureNoTime)) {
+                console.log(`Skipping duplicate meal type: ${mealType}`);
+                skippedCount++;
+                continue;
+              }
+              
+              const newMeal = {
+                foodName: foodName,
+                name: foodName,
+                nutrition: {
+                  calories: calories,
+                  protein: Math.round((dateData.protein || 0) * proportion),
+                  carbs: Math.round((dateData.carbs || 0) * proportion),
+                  fats: Math.round((dateData.fats || 0) * proportion)
+                },
+                mealType,
+                timestamp
+              };
+              
+              mealsData[date].push(newMeal);
+              
+              // Add the signature to the set to prevent duplicates in the same run
+              existingMealSignatures.add(signature);
+              existingMealSignatures.add(signatureNoTime);
+              
+              console.log(`Migrated ${mealType} with ${proportion * 100}% of nutrition data for ${date}`);
+              migratedCount++;
+            }
+          } else {
+            console.log(`Skipping nutrition distribution for ${date} as it already has meals`);
+          }
+        }
+      }
+      
+      // Update userMeals with the migrated data only if we added new meals
+      if (migratedCount > 0) {
+        await setDoc(mealsRef, mealsData, { merge: true });
+        console.log(`Migration complete: ${migratedCount} meals migrated, ${skippedCount} skipped as duplicates`);
+        
+        // Show success message to user
+        setSnackbar({
+          open: true,
+          message: `${migratedCount} meals have been migrated to your meal log`,
+          severity: 'success'
+        });
+        
+        // Update local UI with the new migrated meals
+        fetchAllMeals();
+      } else {
+        console.log(`No meals needed migration (${skippedCount} duplicates skipped)`);
+        setSnackbar({
+          open: true,
+          message: `No new meals needed to be migrated`,
+          severity: 'info'
+        });
+      }
+      
+      migrationCompletedRef.current = true;
+    } catch (error) {
+      console.error('Error during meal migration:', error);
+      setSnackbar({
+        open: true,
+        message: 'Failed to migrate meals: ' + error.message,
+        severity: 'error'
+      });
+    }
+  };
 
+  // Modify the fetchAllMeals function
+  const fetchAllMeals = useCallback(async () => {
+    try {
+      if (!auth.currentUser) return;
+
+      const userId = auth.currentUser.uid;
+      const today = new Date().toISOString().split('T')[0];
+      
+      // Get cached meal status first
+      const cachedStatus = localStorage.getItem(`mealStatus_${today}`);
+      if (cachedStatus) {
+        const parsedStatus = JSON.parse(cachedStatus);
+        // Only update if different from current state
+        if (JSON.stringify(parsedStatus) !== JSON.stringify(mealStatus)) {
+          setMealStatus(parsedStatus);
+        }
+      }
+
+      // Single fetch for meals
+      const mealsRef = doc(db, 'userMeals', userId);
+      const mealsDoc = await getDoc(mealsRef);
+      
+      const meals = {
+        breakfast: { calories: 0, protein: 0, carbs: 0, fats: 0 },
+        lunch: { calories: 0, protein: 0, carbs: 0, fats: 0 },
+        dinner: { calories: 0, protein: 0, carbs: 0, fats: 0 },
+        snacks: { calories: 0, protein: 0, carbs: 0, fats: 0 }
+      };
+      
+      let newMealStatus = {
+        breakfast: false,
+        lunch: false,
+        dinner: false,
+        snacks: false
+      };
+      
+      if (mealsDoc.exists()) {
+        const todaysMealData = mealsDoc.data()[today] || [];
+        
+        if (Array.isArray(todaysMealData)) {
+          todaysMealData.forEach(meal => {
+            const mealType = meal.mealType;
+            if (!mealType) return;
+            
+            const nutrition = meal.nutrition || {};
+            meals[mealType].calories += Number(nutrition.calories) || 0;
+            meals[mealType].protein += Number(nutrition.protein) || 0;
+            meals[mealType].carbs += Number(nutrition.carbs) || 0;
+            meals[mealType].fats += Number(nutrition.fats) || 0;
+            
+            // Mark meal as completed if it has any calories
+            if (meals[mealType].calories > 0) {
+              newMealStatus[mealType] = true;
+            }
+          });
+        }
+      }
+
+      // Only update states if they've changed
+      if (JSON.stringify(meals) !== JSON.stringify(todaysMeals)) {
+        setTodaysMeals(meals);
+      }
+      
+      // Only update if status has changed
+      const statusChanged = Object.keys(newMealStatus).some(
+        mealType => newMealStatus[mealType] !== mealStatus[mealType]
+      );
+
+      if (statusChanged) {
+        setMealStatus(newMealStatus);
+        localStorage.setItem(`mealStatus_${today}`, JSON.stringify(newMealStatus));
+        
+        // Debounce the Firestore update
+        if (canWriteToFirestore()) {
+          debouncedFirestoreUpdate(userId, today, newMealStatus);
+          setWriteCount(prev => prev + 1);
+          setDailyWriteCount(prev => prev + 1);
+        }
+      }
+      
+    } catch (error) {
+      console.error('Error fetching meals:', error);
+    }
+  }, [auth.currentUser, mealStatus, todaysMeals, canWriteToFirestore]);
+
+  // Add this to the migrateMealsFromProgress function just before migrationCompletedRef.current = true
+  // Replace the existing line with fetchAllMeals && fetchAllMeals() with this:
+  
+  // Update the component with the new migrated meals
+  fetchAllMeals();
+
+  // Modify the useEffect that monitors mealStatus changes
+  useEffect(() => {
+    let isMounted = true;
+
+    const updateStreakOnMealCompletion = async () => {
+      try {
+        if (!currentUser) return;
+
+        const today = new Date().toISOString().split('T')[0];
+        const streakRef = doc(db, 'userStreaks', currentUser.uid);
+        
+        // Get current streak data
+        const streakDoc = await getDoc(streakRef);
+        let history = {};
+        if (streakDoc.exists()) {
+          history = streakDoc.data().history || {};
+        }
+        
+        // Update today's status
+        history[today] = true;
+        
+        // Use a batch write to ensure atomicity
+        const batch = writeBatch(db);
+        batch.set(streakRef, {
+          history,
+          lastUpdated: serverTimestamp(),
+          userId: currentUser.uid
+        }, { merge: true });
+        
+        await batch.commit();
+        
+        // Update local state
+        setCompletedDates(prev => [...new Set([...prev, today])]);
+        
+        // Recalculate streak
+        const newStreak = calculateStreak(history);
+        setStreak(newStreak);
+      } catch (error) {
+        console.error('Error updating streak:', error);
+      }
+    };
+    
+    updateStreakOnMealCompletion();
+
+    return () => {
+      isMounted = false;
+    };
+  }, [currentUser]);
+
+  const clearLocalStorage = async () => {
+    try {
+      // Clear all localStorage items
+      localStorage.clear();
+      
+      // Clear Firestore cache
+      await db.clearPersistence();
+      
+      // Reload the page to reset the application state
+      window.location.reload();
+    } catch (error) {
+      console.error('Error clearing storage:', error);
+    }
+  };
+
+  const clearCache = async () => {
+    try {
+      // Clear localStorage
+      localStorage.clear();
+      
+      // Clear Firestore cache
+      await db.clearPersistence();
+      
+      // Reload the page to reset the application state
+      window.location.reload();
+    } catch (error) {
+      console.error('Error clearing cache:', error);
+    }
+  };
+
+  // Add these styles at the top of the file after imports
+  const calendarStyles = {
+    '.react-calendar': {
+      width: '100%',
+      maxWidth: '100%',
+      background: 'white',
+      border: '1px solid #a0a096',
+      fontFamily: 'Arial, Helvetica, sans-serif',
+      lineHeight: '1.125em',
+      borderRadius: '8px',
+      padding: '8px'
+    },
+    '.react-calendar__navigation': {
+      display: 'flex',
+      height: '44px',
+      marginBottom: '1em'
+    },
+    '.react-calendar__navigation button': {
+      minWidth: '44px',
+      background: 'none',
+      border: 'none',
+      color: '#6f48eb',
+      fontSize: '16px',
+      marginTop: '8px'
+    },
+    '.react-calendar__navigation button:enabled:hover, .react-calendar__navigation button:enabled:focus': {
+      backgroundColor: '#f8f8fa'
+    },
+    '.react-calendar__navigation button[disabled]': {
+      backgroundColor: '#f0f0f0'
+    },
+    '.react-calendar__month-view__weekdays': {
+      textAlign: 'center',
+      textTransform: 'uppercase',
+      fontWeight: 'bold',
+      fontSize: '0.75em'
+    },
+    '.react-calendar__month-view__weekdays__weekday': {
+      padding: '0.5em'
+    },
+    '.react-calendar__month-view__weekNumbers .react-calendar__tile': {
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'center',
+      fontSize: '0.75em',
+      fontWeight: 'bold'
+    },
+    '.react-calendar__month-view__days__day--weekend': {
+      color: '#000000'
+    },
+    '.react-calendar__month-view__days__day--neighboringMonth': {
+      color: '#757575'
+    },
+    '.react-calendar__year-view .react-calendar__tile, .react-calendar__decade-view .react-calendar__tile, .react-calendar__century-view .react-calendar__tile': {
+      padding: '2em 0.5em'
+    },
+    '.react-calendar__tile': {
+      maxWidth: '100%',
+      padding: '10px 6.6667px',
+      background: 'none',
+      textAlign: 'center',
+      lineHeight: '16px',
+      border: 'none',
+      borderRadius: '4px'
+    },
+    '.react-calendar__tile:disabled': {
+      backgroundColor: '#f0f0f0'
+    },
+    '.react-calendar__tile:enabled:hover, .react-calendar__tile:enabled:focus': {
+      backgroundColor: '#e6e6fa'
+    },
+    '.react-calendar__tile--now': {
+      background: '#ffff76'
+    },
+    '.react-calendar__tile--now:enabled:hover, .react-calendar__tile--now:enabled:focus': {
+      background: '#ffffa9'
+    },
+    '.react-calendar__tile--hasActive': {
+      background: '#76baff'
+    },
+    '.react-calendar__tile--hasActive:enabled:hover, .react-calendar__tile--hasActive:enabled:focus': {
+      background: '#a9d4ff'
+    },
+    '.react-calendar__tile--active': {
+      background: '#6f48eb',
+    },
+    '.react-calendar__tile--active:enabled:hover, .react-calendar__tile--active:enabled:focus': {
+      background: '#7c5cf1'
+    },
+    '.react-calendar--selectRange .react-calendar__tile--hover': {
+      backgroundColor: '#e6e6fa'
+    },
+    '.streak-day': {
+      backgroundColor: 'rgba(76, 175, 79, 0.52) !important'
+    },
+    '.missed-day': {
+      backgroundColor: 'rgba(244, 67, 54, 0.52) !important'
+    }
+  };
+
+  // Modify the calendar tile class and content functions
+  const tileClassName = ({ date }) => {
+    const dateStr = date.toISOString().split('T')[0];
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    
+    // Convert date strings to Date objects for comparison
+    const dateObj = new Date(date);
+    dateObj.setHours(0, 0, 0, 0);
+    
+    // Format the date string to match Firestore format (YYYY-MM-DD)
+    const formattedDate = `${dateObj.getFullYear()}-${String(dateObj.getMonth() + 1).padStart(2, '0')}-${String(dateObj.getDate()).padStart(2, '0')}`;
+    
+    // Check if the date is in completedDates
+    if (completedDates.includes(formattedDate)) {
+      return 'streak-day';
+    }
+    
+    // Only mark as missed if it's a past date and not completed
+    if (dateObj < today && !completedDates.includes(formattedDate)) {
+      return 'missed-day';
+    }
+    
+    return '';
+  };
+
+  const tileContent = ({ date }) => {
+    const dateObj = new Date(date);
+    dateObj.setHours(0, 0, 0, 0);
+    
+    // Format the date string to match Firestore format (YYYY-MM-DD)
+    const formattedDate = `${dateObj.getFullYear()}-${String(dateObj.getMonth() + 1).padStart(2, '0')}-${String(dateObj.getDate()).padStart(2, '0')}`;
+    
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    
+    // Show icons for completed days
+    if (completedDates.includes(formattedDate)) {
+      return <CheckCircleIcon sx={{ color: 'success.main', fontSize: 16 }} />;
+    }
+    
+    // Show X for missed days (past dates that weren't completed)
+    if (dateObj < today && !completedDates.includes(formattedDate)) {
+      return <CancelIcon sx={{ color: 'error.main', fontSize: 16 }} />;
+    }
+    
+    return null;
+  };
+
+  const activateCamera = async () => {
+    try {
+      setError(null);
+      setCameraError(null);
+
+      // Check if browser supports getUserMedia
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        throw new Error('Your browser does not support camera access');
+      }
+
+      // Request camera permissions
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          facingMode: 'environment',
+          width: { ideal: 1920 },
+          height: { ideal: 1080 }
+        }
+      });
+
+      // Update state and refs
+      setHasCamera(true);
+      setCameraPermission('granted');
+      setIsCameraActive(true);
+      
+      // Set up video stream
+      if (webcamRef.current && webcamRef.current.video) {
+        webcamRef.current.video.srcObject = stream;
+      }
+      
+      streamRef.current = stream;
+    } catch (error) {
+      console.error('Camera activation error:', error);
+      
+      // Handle specific error types
+      if (error.name === 'NotAllowedError' || error.name === 'PermissionDeniedError') {
+        setCameraError('Camera access denied. Please grant permission to use your camera.');
+        setCameraPermission('denied');
+      } else if (error.name === 'NotFoundError' || error.name === 'DevicesNotFoundError') {
+        setCameraError('No camera found on your device.');
+        setHasCamera(false);
+      } else if (error.name === 'NotReadableError' || error.name === 'TrackStartError') {
+        setCameraError('Your camera is in use by another application.');
+      } else {
+        setCameraError('Failed to access camera: ' + error.message);
+      }
+      
+      setHasCamera(false);
+      setIsCameraActive(false);
+    }
+  };
+
+  const updateMealStatus = async (mealType, progress) => {
+    try {
+      if (!auth.currentUser) return;
+
+      const userId = auth.currentUser.uid;
+      const today = new Date().toISOString().split('T')[0];
+
+      // Get current cached status
+      const cachedStatus = localStorage.getItem(MEAL_STATUS_CACHE_KEY);
+      let currentMealStatus = {
+        breakfast: false,
+        lunch: false,
+        dinner: false,
+        snacks: false
+      };
+
+      if (cachedStatus) {
+        try {
+          currentMealStatus = JSON.parse(cachedStatus);
+        } catch (error) {
+          console.error('Error parsing cached meal status:', error);
+        }
+      }
+
+      // Update the specific meal status based on progress
+      const mealComplete = progress.calories >= 90 || progress.nutrientsReached90Percent >= 2;
+      
+      // Only proceed if the status has actually changed
+      if (currentMealStatus[mealType] !== mealComplete) {
+        currentMealStatus[mealType] = mealComplete;
+
+        // Save to localStorage
+        localStorage.setItem(MEAL_STATUS_CACHE_KEY, JSON.stringify(currentMealStatus));
+        setMealStatus(currentMealStatus);
+
+        // Check if all meals are completed
+        const allMealsCompleted = Object.values(currentMealStatus).every(status => status);
+
+        // Update streak data
+        const streakRef = doc(db, 'userStreaks', userId);
+        const streakDoc = await getDoc(streakRef);
+        const streakData = streakDoc.exists() ? streakDoc.data() : { history: {} };
+
+        // Update the history with the current day's status
+        const updatedHistory = {
+          ...streakData.history,
+          [today]: allMealsCompleted
+        };
+
+        // Update local state for calendar display
+        if (allMealsCompleted) {
+          setCompletedDates(prev => {
+            const newDates = new Set(prev);
+            newDates.add(today);
+            return Array.from(newDates);
+          });
+          setMissedDates(prev => prev.filter(date => date !== today));
+        }
+
+        // Use the debounced update function
+        debouncedUpdateMealStatus(userId, today, currentMealStatus);
+      }
+    } catch (error) {
+      console.error('Error updating meal status:', error);
+    }
+  };
+
+  const processImage = useCallback(async (file) => {
+    try {
+      setIsProcessing(true);
+      setError(null);
+      setDetectedFood(null);
+      setCapturedImage(URL.createObjectURL(file));
+
+      const formData = new FormData();
+      formData.append('image', file);
+
+      // First, detect all food items in the image
+      const detectionResponse = await fetch(`${getServerUrl()}/detect`, {
+        method: 'POST',
+        body: formData
+      });
+
+      if (!detectionResponse.ok) {
+        throw new Error('Failed to detect food');
+      }
+
+      const detectionData = await detectionResponse.json();
+      console.log('Detection response:', detectionData);
+
+      if (!detectionData.success || !detectionData.foodItems || detectionData.foodItems.length === 0) {
+        throw new Error('No food detected in the image');
+      }
+
+      // Get nutrition data for all detected food items
+      const foodItems = detectionData.foodItems;
+      let totalNutrition = {
+        calories: 0,
+        protein: 0,
+        carbs: 0,
+        fats: 0
+      };
+
+      const detectedFoodNames = [];
+
+      // Process each detected food item
+      for (const foodName of foodItems) {
+        const nutritionResponse = await fetch(`${getServerUrl()}/get_nutrition`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ food_name: foodName })
+        });
+        
+        if (!nutritionResponse.ok) {
+          console.warn(`Failed to get nutrition data for ${foodName}`);
+          continue;
+        }
+
+        const nutritionData = await nutritionResponse.json();
+        console.log(`Nutrition data for ${foodName}:`, nutritionData);
+
+        // Add to total nutrition values
+        totalNutrition.calories += Number(nutritionData.total?.calories || nutritionData.calories || 0);
+        totalNutrition.protein += Number(nutritionData.total?.protein || nutritionData.protein || 0);
+        totalNutrition.carbs += Number(nutritionData.total?.carbs || nutritionData.carbs || 0);
+        totalNutrition.fats += Number(nutritionData.total?.fats || nutritionData.fats || 0);
+        
+        detectedFoodNames.push(foodName);
+      }
+
+      // Round the total nutrition values
+      totalNutrition = {
+        calories: Math.round(totalNutrition.calories),
+        protein: Math.round(totalNutrition.protein),
+        carbs: Math.round(totalNutrition.carbs),
+        fats: Math.round(totalNutrition.fats)
+      };
+
+      console.log('Total nutrition for all items:', totalNutrition);
+
+      // Create the meal data object with combined data
+      const mealData = {
+        foodName: detectedFoodNames.join(', '),
+        name: detectedFoodNames.join(', '),
+        nutrition: totalNutrition,
+        imageUrl: URL.createObjectURL(file),
+        timestamp: new Date().toISOString(),
+        foodItems: detectedFoodNames // Store individual food items
+      };
+
+      // Set the detected food for display
+      setDetectedFood(mealData);
+
+      // Show success message with all detected items
+      setSnackbar({
+        open: true,
+        message: `Detected: ${detectedFoodNames.join(', ')}. Logging meal...`,
+        severity: 'info'
+      });
+
+      // Automatically log the meal after a short delay
+      setTimeout(() => {
+        handleAddMeal(mealData);
+      }, 1500);
+
+    } catch (error) {
+      console.error('Error processing image:', error);
+      setError(error.message);
+      setSnackbar({
+        open: true,
+        message: error.message,
+        severity: 'error'
+      });
+    } finally {
+      setIsProcessing(false);
+      // Make sure camera is deactivated in case of error
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach(track => {
+          if (track.readyState === 'live') {
+            track.stop();
+          }
+        });
+        setIsCameraActive(false);
+      }
+    }
+  }, [handleAddMeal]);
+
+  const deactivateCamera = () => {
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(track => track.stop());
+    }
+    setIsCameraActive(false);
+    setCapturedImage(null);
+    setPredictionResult(null);
+  };
+
+  const captureImage = useCallback(() => {
+    if (webcamRef.current) {
+      const imageSrc = webcamRef.current.getScreenshot();
+      // Convert base64 to blob
+      fetch(imageSrc)
+        .then(res => res.blob())
+        .then(blob => {
+          // Create File object with original format
+          const file = new File([blob], "captured-image.jpg", { type: blob.type });
+          console.log('Created file from capture:', file.name, file.type, file.size);
+          // Deactivate camera after successful capture
+          deactivateCamera();
+          // Set captured image
+          setCapturedImage(URL.createObjectURL(file));
+          // Process the image
+          processImage(file);
+        })
+        .catch(error => {
+          console.error('Error converting image:', error);
+          setError('Failed to process captured image');
+        });
+    }
+  }, []);
+
+  // Update the useEffect that syncs calendar with streak data
+  useEffect(() => {
+    const syncCalendarData = async () => {
+      if (!auth.currentUser) return;
+      
+      try {
+        // Set up real-time listener for streak updates
+        const streakRef = doc(db, 'userStreaks', auth.currentUser.uid);
+        const unsubscribe = onSnapshot(streakRef, (doc) => {
+          if (doc.exists()) {
+            const data = doc.data();
+            const history = data.history || {};
+            
+            // Calculate current streak from history
+            const currentStreak = calculateStreak(history);
+            setStreak(currentStreak);
+            
+            // Update calendar data
+            const completed = [];
+            const missed = [];
+            
+            // Process all dates
+            const today = new Date();
+            today.setHours(0, 0, 0, 0);
+            
+            Object.entries(history).forEach(([date, status]) => {
+              const entryDate = new Date(date);
+              entryDate.setHours(0, 0, 0, 0);
+              
+              // Only process dates up to today
+              if (entryDate <= today) {
+                if (status === true) {
+                  completed.push(date);
+                } else {
+                  missed.push(date);
+                }
+              }
+            });
+            
+            // Sort the arrays chronologically
+            completed.sort();
+            missed.sort();
+            
+            // Update calendar states
+            setCompletedDates(completed);
+            setMissedDates(missed);
+            
+            // Remove redundant console logs and keep only one essential update
+            if (process.env.NODE_ENV === 'development') {
+              console.log(`Streak data updated: ${currentStreak} day streak`);
+            }
+          }
+        });
+
+        return () => unsubscribe();
+      } catch (error) {
+        console.error('Error in calendar sync:', error);
+      }
+    };
+
+    syncCalendarData();
+  }, [auth.currentUser]);
+
+  // Remove the loading check before the return statement and integrate it into the component
   return (
     <Box
       sx={{
@@ -1550,6 +2497,37 @@ const Dashboard = () => {
       }}
     >
       <Container maxWidth="xl">
+        {/* Show quota exceeded warning at the top */}
+        {isQuotaExceeded && (
+          <Alert severity="warning" sx={{ mb: 2 }}>
+            <AlertTitle>Firestore Quota Exceeded</AlertTitle>
+            You can continue using the app with limited functionality. Your data will be saved locally.
+          </Alert>
+        )}
+
+        {/* Show write limit warning if needed */}
+        {writeCount >= MAX_TOTAL_WRITES && (
+          <Alert severity="warning" sx={{ mb: 2 }}>
+            <AlertTitle>Write Limit Reached</AlertTitle>
+            You've reached the maximum number of writes. Some features may be limited.
+          </Alert>
+        )}
+        
+        {/* Show daily write limit warning if needed */}
+        {dailyWriteCount >= MAX_DAILY_WRITES && (
+          <Alert severity="info" sx={{ mb: 2 }}>
+            <AlertTitle>Daily Write Limit Reached</AlertTitle>
+            You've reached today's write limit. Your data will be saved locally.
+          </Alert>
+        )}
+        
+        {/* Show any other errors */}
+        {error && !isQuotaExceeded && (
+          <Alert severity="error" sx={{ mb: 2 }}>
+            {error}
+          </Alert>
+        )}
+        
         <Grid container spacing={2}>
           {/* Camera Interface Card */}
           <Grid item xs={12}>
@@ -1577,183 +2555,161 @@ const Dashboard = () => {
               <Grid item xs={12} md={6}>
                 <Card sx={{ 
                   backgroundColor: 'rgba(255, 255, 255, 0.9)',
-                  height: '100%'
+                  height: '100%',
+                  display: 'flex',
+                  flexDirection: 'column'
                 }}>
-                  <CardContent sx={{ p: 2 }}>
+                  <CardContent sx={{ flex: 1, p: 2 }}>
+                    <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 2 }}>
+                      <Typography variant="h6">Calendar</Typography>
+                      <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                        <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
+                          <CheckCircleIcon sx={{ color: 'success.main', fontSize: 16 }} />
+                          <Typography variant="caption">Streak Day</Typography>
+                        </Box>
+                        <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
+                          <CancelIcon sx={{ color: 'error.main', fontSize: 16 }} />
+                          <Typography variant="caption">Missed Day</Typography>
+                        </Box>
+                      </Box>
+                    </Box>
+                    <Box sx={{ ...calendarStyles }}>
+                      <Calendar
+                        onChange={setSelectedDate}
+                        value={selectedDate}
+                        tileClassName={tileClassName}
+                        tileContent={tileContent}
+                      />
+                    </Box>
                     <Box sx={{ 
                       display: 'flex', 
                       alignItems: 'center', 
-                      mb: 1,
-                      backgroundColor: 'primary.light',
-                      p: 2,
-                      borderRadius: 1
+                      justifyContent: 'center', 
+                      mt: 2,
+                      gap: 1
                     }}>
-                      <FireIcon sx={{ color: '#ff6b6b', mr: 1, fontSize: 28 }} />
-                      <Box>
-                        <Typography variant="h6" sx={{ color: 'text.primary', fontWeight: 600 }}>
-                          Current Streak: {streak} days
-                        </Typography>
-                        <Typography variant="body2" sx={{ color: 'text.secondary', mt: 0.5 }}>
-                          Next milestone: {streak + (5 - (streak % 5))} days
-                        </Typography>
-                      </Box>
+                      <FireIcon sx={{ color: 'warning.main' }} />
+                      <Typography variant="h6" color="warning.main">
+                        {streak} Day{streak !== 1 ? 's' : ''} Streak
+                      </Typography>
                     </Box>
-                    <LocalizationProvider dateAdapter={AdapterDateFns}>
-                      <StaticDatePicker
-                        displayStaticWrapperAs="desktop"
-                        openTo="day"
-                        value={selectedDate}
-                        onChange={(newDate) => setSelectedDate(newDate)}
-                        renderDay={renderDay}
+                  </CardContent>
+                </Card>
+              </Grid>
+            </Grid>
+          </Grid>
+        </Grid>
+
+        {/* Streak Info Card */}
+        <Grid item xs={12} sx={{ mt: 4 }}>
+          <Card sx={{ 
+            backgroundColor: 'rgba(255, 255, 255, 0.9)',
+            height: '100%'
+          }}>
+            <CardContent sx={{ p: 2 }}>
+              <Typography variant="h6" gutterBottom sx={{ 
+                borderBottom: '2px solid',
+                borderColor: 'primary.main',
+                pb: 1,
+                mb: 2
+              }}>
+                Streak Information
+              </Typography>
+              <Box sx={{ 
+                display: 'flex',
+                flexDirection: 'column',
+                gap: 2,
+                p: 2,
+                backgroundColor: 'rgba(76, 175, 80, 0.1)',
+                borderRadius: 1
+              }}>
+                <Typography variant="body1" sx={{ fontWeight: 500, color: 'text.primary' }}>
+                  Keep up the great work! Track your meals daily to maintain your streak.
+                </Typography>
+                <Box sx={{ 
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: 1.5,
+                  mt: 1
+                }}>
+                  {[
+                    'Complete all meals to increase your streak',
+                    'Streak resets if you miss any meal',
+                    'Green dates indicate successful diet days',
+                    'Red dates indicate missed diet goals'
+                  ].map((text, index) => (
+                    <Box key={index} sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                      <Box
                         sx={{
-                          width: '100%',
-                          '& .MuiPickersCalendarHeader-root': {
-                            display: 'flex',
-                            alignItems: 'center',
-                            justifyContent: 'space-between',
-                            pl: 2,
-                            pr: 2
-                          },
-                          '& .MuiPickersCalendarHeader-label': {
-                            fontSize: '1rem',
-                            fontWeight: 500
-                          },
-                          '& .MuiPickersDay-root': {
-                            fontSize: '0.9rem',
-                            margin: '2px',
-                            height: 36,
-                            width: 36
-                          },
-                          '& .MuiPickersDay-today': {
-                            border: '2px solid',
-                            borderColor: 'primary.main'
-                          }
+                          width: 6,
+                          height: 6,
+                          borderRadius: '50%',
+                          backgroundColor: 'success.main'
                         }}
                       />
-                    </LocalizationProvider>
-                  </CardContent>
-                </Card>
-              </Grid>
-            </Grid>
-          </Grid>
-
-          {/* Bottom Row - Today's Meals and Streak Info */}
-          <Grid item xs={12}>
-            <Grid container spacing={2}>
-              {/* Today's Meals Card */}
-              <Grid item xs={12} md={6}>
-                <Card sx={{ 
-                  backgroundColor: 'rgba(255, 255, 255, 0.9)',
-                  height: '100%'
-                }}>
-                  <CardContent sx={{ p: 2 }}>
-                    <Typography variant="h6" gutterBottom sx={{ 
-                      borderBottom: '2px solid',
-                      borderColor: 'primary.main',
-                      pb: 1,
-                      mb: 2
-                    }}>
-                      Today's Meals
-                    </Typography>
-                    <Grid container spacing={2} sx={{ mt: 0 }}>
-                      {MEAL_ORDER.map((meal) => (
-                        <Grid item xs={6} sm={3} key={meal}>
-                          <Card
-                            elevation={mealStatus[meal] ? 3 : 1}
-                            sx={{
-                              cursor: 'pointer',
-                              bgcolor: mealStatus[meal] ? 'primary.light' : 'background.paper',
-                              transition: 'all 0.3s',
-                              '&:hover': { transform: 'scale(1.02)' },
-                              border: mealStatus[meal] ? '2px solid' : '1px solid',
-                              borderColor: mealStatus[meal] ? 'primary.main' : 'grey.300',
-                              height: '100%'
-                            }}
-                          >
-                            <CardContent sx={{ p: '16px !important', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center' }}>
-                              <Typography
-                                variant="subtitle1"
-                                sx={{ 
-                                  textTransform: 'capitalize',
-                                  fontWeight: mealStatus[meal] ? 600 : 400,
-                                  color: mealStatus[meal] ? 'primary.main' : 'text.primary',
-                                  mb: 1
-                                }}
-                              >
-                                {meal}
-                              </Typography>
-                              <CheckCircleIcon
-                                color={mealStatus[meal] ? 'primary' : 'disabled'}
-                                sx={{ fontSize: 32 }}
-                              />
-                            </CardContent>
-                          </Card>
-                        </Grid>
-                      ))}
-                    </Grid>
-                  </CardContent>
-                </Card>
-              </Grid>
-
-              {/* Streak Info Card */}
-              <Grid item xs={12} md={6}>
-                <Card sx={{ 
-                  backgroundColor: 'rgba(255, 255, 255, 0.9)',
-                  height: '100%'
-                }}>
-                  <CardContent sx={{ p: 2 }}>
-                    <Typography variant="h6" gutterBottom sx={{ 
-                      borderBottom: '2px solid',
-                      borderColor: 'primary.main',
-                      pb: 1,
-                      mb: 2
-                    }}>
-                      Streak Information
-                    </Typography>
-                    <Box sx={{ 
-                      display: 'flex',
-                      flexDirection: 'column',
-                      gap: 2,
-                      p: 2,
-                      backgroundColor: 'rgba(76, 175, 80, 0.1)',
-                      borderRadius: 1
-                    }}>
-                      <Typography variant="body1" sx={{ fontWeight: 500, color: 'text.primary' }}>
-                        Keep up the great work! Track your meals daily to maintain your streak.
+                      <Typography variant="body2" sx={{ color: 'text.secondary' }}>
+                        {text}
                       </Typography>
-                      <Box sx={{ 
-                        display: 'flex',
-                        flexDirection: 'column',
-                        gap: 1.5,
-                        mt: 1
-                      }}>
-                        {[
-                          'Complete all meals to increase your streak',
-                          'Streak resets if you miss any meal',
-                          'Green dates indicate successful diet days',
-                          'Red dates indicate missed diet goals'
-                        ].map((text, index) => (
-                          <Box key={index} sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
-                            <Box
-                              sx={{
-                                width: 6,
-                                height: 6,
-                                borderRadius: '50%',
-                                backgroundColor: 'success.main'
-                              }}
-                            />
-                            <Typography variant="body2" sx={{ color: 'text.secondary' }}>
-                              {text}
-                            </Typography>
-                          </Box>
-                        ))}
-                      </Box>
                     </Box>
-                  </CardContent>
-                </Card>
-              </Grid>
-            </Grid>
-          </Grid>
+                  ))}
+                </Box>
+                
+                {/* Display last sync info */}
+                <Box sx={{ mt: 1, mb: 1 }}>
+                  <Typography variant="body2" sx={{ color: 'text.secondary', fontSize: '0.85rem', mb: 1 }}>
+                    {localStorage.getItem('migrationCompleted') 
+                      ? 'Meal data synced in this session' 
+                      : 'No meal sync performed yet'}
+                  </Typography>
+                </Box>
+                
+                {/* Add action buttons */}
+                <Stack direction="row" spacing={2} justifyContent="center" sx={{ mt: 1 }}>
+                  {/* Sync Missing Meals button */}
+                  <Button 
+                    variant="outlined"
+                    color="primary"
+                    startIcon={<RestaurantIcon />}
+                    onClick={() => {
+                      if (auth.currentUser) {
+                        migrationCompletedRef.current = false;
+                        localStorage.removeItem('migrationCompleted');
+                        migrateMealsFromProgress(auth.currentUser.uid);
+                      }
+                    }}
+                    size="small"
+                    disabled={loading}
+                  >
+                    Sync Meals
+                  </Button>
+                  
+                  {/* Recalculate Streak button */}
+                  <Button 
+                    variant="outlined"
+                    color="secondary"
+                    startIcon={<FireIcon />}
+                    onClick={recalculateStreak}
+                    size="small"
+                    disabled={loading}
+                  >
+                    Fix Streak
+                  </Button>
+                  
+                  {/* Clear Cache button */}
+                  <Button 
+                    variant="outlined"
+                    color="error"
+                    startIcon={<DeleteIcon />}
+                    onClick={clearCache}
+                    size="small"
+                    disabled={loading}
+                  >
+                    Clear Cache
+                  </Button>
+                </Stack>
+              </Box>
+            </CardContent>
+          </Card>
         </Grid>
       </Container>
     </Box>

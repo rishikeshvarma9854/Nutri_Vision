@@ -1,17 +1,29 @@
 // Get the server URL based on the environment
-const getServerUrl = () => 'http://localhost:5000';
+export const getServerUrl = () => {
+  const host = window.location.hostname;
+  const isLocalhost = host === 'localhost' || host === '127.0.0.1';
+  const port = isLocalhost ? '5000' : '443';
+  const protocol = isLocalhost ? 'http' : 'https';
+  return `${protocol}://${host}:${port}`;
+};
+
+export const API_BASE_URL = getServerUrl();
 
 // API endpoints
 export const API_ENDPOINTS = {
-  DETECT: `${getServerUrl()}/detect`,
-  GET_NUTRITION: `${getServerUrl()}/get_nutrition`,
-  HEALTH_CHECK: `${getServerUrl()}/health`
+    DETECT_FOOD: `${API_BASE_URL}/detect`,
+    GET_NUTRITION: `${API_BASE_URL}/get_nutrition`,
+    CLASSIFY_MEAL: `${API_BASE_URL}/classify_meal`,
+    HEALTH_CHECK: `${API_BASE_URL}/health`
 };
 
 // API configuration
 export const API_CONFIG = {
+  timeout: 30000,
+  retries: 3,
   headers: {
-    'Accept': 'application/json'
+    'Accept': 'application/json',
+    'Content-Type': 'application/json'
   }
 };
 
@@ -34,10 +46,7 @@ export const checkServerHealth = async () => {
   try {
     const response = await fetch(API_ENDPOINTS.HEALTH_CHECK, {
       method: 'GET',
-      mode: 'cors',
-      headers: {
-        'Accept': 'application/json'
-      }
+      headers: API_CONFIG.headers
     });
     if (!response.ok) {
       throw new Error(`HTTP error! status: ${response.status}`);

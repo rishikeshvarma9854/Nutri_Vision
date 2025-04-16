@@ -1,3 +1,35 @@
+# dependencies
+/node_modules
+/.pnp
+.pnp.js
+
+# testing
+/coverage
+
+# production
+/build
+/dist
+
+# misc
+.DS_Store
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+
 # Logs
 logs
 *.log
@@ -67,16 +99,3 @@ node_modules/
 
 # dataconnect generated files
 .dataconnect
-
-# Large model files
-server/efficientnet_v2_food256.pth
-*.pth
-*.pt
-*.bin
-*.h5
-*.onnx
-
-# Build files
-build/
-dist/
-*.js.map
