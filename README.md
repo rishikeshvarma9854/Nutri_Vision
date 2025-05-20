@@ -112,4 +112,17 @@ The application uses Google's Gemini AI to:
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details. 
+This project is made by 2nd-year students of  KMIT as a Real-time Research Project by the
+
+## Team Sainz
+
+- 🧠 Vineel Yerubandi — Team Lead & Database designer
+   -->Led the team and played a key role in training the AI model & in creating the Database design.
+- 🤖 K. Sri Rishikesh Varma — AI Developer
+   -->Developed the AI model and implemented its integration with the backend system.
+- 🎨 Kota Shiva Tarak Reddy — UI Designer & Data Contributor
+   -->Designed the user interface and actively participated in data gathering for training the AI model.
+- 🔧 Solomon Heron — Backend Developer & Data Scientist
+   -->Handled the backend systems and collaborated in data collection, preprocessing, and labeling.
+- 💻 Satyadeva — Frontend Developer & Tester
+   -->Built the frontend interface and conducted rigorous testing of the application to ensure quality.
