@@ -1,5 +1,6 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
+import { VitePWA } from 'vite-plugin-pwa'
 import fs from 'fs'
 import path from 'path'
 import { networkInterfaces } from 'os'
@@ -28,13 +29,13 @@ const generateOrigins = () => {
     'https://nutri-vision-704d5.web.app',
     'https://nutri-vision-704d5.firebaseapp.com',
     'http://localhost:3000',
-    'http://localhost:5000'
+    'https://nutri-vision.onrender.com',
+    'https://nutri-vision-app-gqepd5e8cyc8hgez.southeastasia-01.azurewebsites.net'
   ]
   
-  // Add all local IPs with both ports
+  // Add all local IPs with port 3000
   localIPs.forEach(ip => {
     origins.push(`http://${ip}:3000`)
-    origins.push(`http://${ip}:5000`)
   })
   
   return origins
@@ -42,156 +43,65 @@ const generateOrigins = () => {
 
 // https://vitejs.dev/config/
 export default defineConfig({
-  plugins: [react()],
+  plugins: [
+    react(),
+    VitePWA({
+      registerType: 'autoUpdate',
+      workbox: {
+        globPatterns: ['**/*.{js,css,html,ico,png,svg}']
+      },
+      manifest: {
+        name: 'NutriVision',
+        short_name: 'NutriVision',
+        description: 'Nutrition Chatbot with Gemini AI',
+        theme_color: '#ffffff',
+        icons: [
+          {
+            src: 'pwa-192x192.png',
+            sizes: '192x192',
+            type: 'image/png'
+          },
+          {
+            src: 'pwa-512x512.png',
+            sizes: '512x512',
+            type: 'image/png'
+          }
+        ]
+      },
+      devOptions: {
+        enabled: true,
+        type: 'module'
+      }
+    })
+  ],
   server: {
     host: '0.0.0.0',
     port: 3000,
     strictPort: true,
-    https: false,
-    proxy: {
-      '/detect': {
-        target: 'http://localhost:5000',
-        changeOrigin: true,
-        secure: false,
-        rewrite: (path) => path,
-        ws: true,
-        configure: (proxy, options) => {
-          // Get the host from the request
-          proxy.on('proxyReq', (proxyReq, req, res) => {
-            const host = req.headers.host;
-            if (host && !host.includes('localhost')) {
-              // If accessing through IP, update the target to use the same IP
-              const ip = host.split(':')[0];
-              proxyReq.setHeader('host', `${ip}:5000`);
-              options.target = `http://${ip}:5000`;
-            }
-          });
-          proxy.on('error', (err, req, res) => {
-            console.log('proxy error', err);
-            res.writeHead(500, {
-              'Content-Type': 'text/plain',
-            });
-            res.end('Something went wrong. Please try again later.');
-          });
-        }
-      },
-      '/get_nutrition': {
-        target: 'http://localhost:5000',
-        changeOrigin: true,
-        secure: false,
-        rewrite: (path) => path,
-        ws: true,
-        configure: (proxy, options) => {
-          proxy.on('proxyReq', (proxyReq, req, res) => {
-            const host = req.headers.host;
-            if (host && !host.includes('localhost')) {
-              const ip = host.split(':')[0];
-              proxyReq.setHeader('host', `${ip}:5000`);
-              options.target = `http://${ip}:5000`;
-            }
-          });
-        }
-      },
-      '/classify_meal': {
-        target: 'http://localhost:5000',
-        changeOrigin: true,
-        secure: false,
-        rewrite: (path) => path,
-        ws: true,
-        configure: (proxy, options) => {
-          proxy.on('proxyReq', (proxyReq, req, res) => {
-            const host = req.headers.host;
-            if (host && !host.includes('localhost')) {
-              const ip = host.split(':')[0];
-              proxyReq.setHeader('host', `${ip}:5000`);
-              options.target = `http://${ip}:5000`;
-            }
-          });
-        }
-      },
-      '/health': {
-        target: 'http://localhost:5000',
-        changeOrigin: true,
-        secure: false,
-        rewrite: (path) => path,
-        ws: true,
-        configure: (proxy, options) => {
-          proxy.on('proxyReq', (proxyReq, req, res) => {
-            const host = req.headers.host;
-            if (host && !host.includes('localhost')) {
-              const ip = host.split(':')[0];
-              proxyReq.setHeader('host', `${ip}:5000`);
-              options.target = `http://${ip}:5000`;
-            }
-          });
-        }
-      },
-      '/api': {
-        target: 'http://localhost:5000',
-        changeOrigin: true,
-        secure: false,
-        rewrite: (path) => path.replace(/^\/api/, ''),
-        ws: true,
-        configure: (proxy, options) => {
-          proxy.on('proxyReq', (proxyReq, req, res) => {
-            const host = req.headers.host;
-            if (host && !host.includes('localhost')) {
-              const ip = host.split(':')[0];
-              proxyReq.setHeader('host', `${ip}:5000`);
-              options.target = `http://${ip}:5000`;
-            }
-          });
-          proxy.on('error', (err, req, res) => {
-            console.log('proxy error', err);
-            res.writeHead(500, {
-              'Content-Type': 'text/plain',
-            });
-            res.end('Something went wrong. Please try again later.');
-          });
-        }
-      }
-    },
-    headers: {
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, PATCH, OPTIONS',
-      'Access-Control-Allow-Headers': 'X-Requested-With, content-type, Authorization',
-      'Access-Control-Allow-Credentials': 'true'
-    },
-    fs: {
-      strict: true,
-      allow: ['src']
+    cors: {
+      origin: generateOrigins(),
+      credentials: true
+    }
+  },
+  preview: {
+    port: 3000,
+    strictPort: true,
+    cors: {
+      origin: generateOrigins(),
+      credentials: true
     }
   },
   build: {
     outDir: 'dist',
-    sourcemap: true,
+    assetsDir: 'assets',
+    sourcemap: false,
     rollupOptions: {
-      input: {
-        main: path.resolve(__dirname, 'index.html')
+      output: {
+        manualChunks: {
+          vendor: ['react', 'react-dom', 'react-router-dom'],
+          firebase: ['firebase/app', 'firebase/auth', 'firebase/firestore']
+        }
       }
     }
-  },
-  optimizeDeps: {
-    include: [
-      '@mui/material',
-      '@mui/icons-material',
-      '@emotion/react',
-      '@emotion/styled'
-    ],
-    exclude: [],
-    force: true
-  },
-  resolve: {
-    alias: {
-      '@': path.resolve(__dirname, './src')
-    }
-  },
-  base: '/',
-  publicDir: 'public',
-  cors: {
-    origin: generateOrigins(),
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'Accept'],
-    credentials: true
   }
 }) 

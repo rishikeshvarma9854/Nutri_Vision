@@ -1,18 +1,13 @@
 version: '3.8'
 
 services:
-  web:
+  app:
     build:
       context: .
       dockerfile: Dockerfile
     ports:
-      - "80:80"
+      - "3000:3000"
     environment:
       - NODE_ENV=production
-    restart: unless-stopped
-    networks:
-      - app-network
-
-networks:
-  app-network:
-    driver: bridge 
+      - PORT=3000
+    restart: unless-stopped 

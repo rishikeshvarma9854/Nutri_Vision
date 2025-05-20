@@ -1,0 +1,91 @@
+# Dependencies
+node_modules
+npm-debug.log
+yarn-debug.log
+yarn-error.log
+
+# Build output
+dist
+build
+
+# Environment variables
+
+.env.local
+.env.development
+.env.test
+.env.production
+
+# Version control
+.git
+.gitignore
+
+# IDE
+.idea
+.vscode
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+Dockerfile
+.dockerignore
+
+# Testing
+coverage
+.nyc_output
+
+# Misc
+*.log
+*.md
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+.venv
+venv/
+ENV/
+
+# IDE and editor files
+.idea
+.vscode
+*.swp
+*.swo
+.DS_Store
+
+# Firebase
+.firebase
+firebase-debug.log
+
+# SSL certificates
+*.crt
+*.key
+
+# Test files
+test-*
+*.test.js
+*.spec.js
+
+# Documentation
+README.md
+LICENSE
+
+# Sample and temporary files
+sample/
+tmp/
+temp/
+
+# Proxy server
+proxy/
+proxy-server/
+
+# New additions from the code block
+.env.development.local
+.env.test.local
+.env.production.local
+*.md 

@@ -13,41 +13,53 @@ import {
 import { getStorage } from 'firebase/storage';
 import { getAnalytics } from 'firebase/analytics';
 
-// Get the development auth domain
-const getDevelopmentAuthDomain = () => {
-  // For development, always use the Firebase auth domain
-  // This ensures Google Sign-in works properly
-  return process.env.REACT_APP_FIREBASE_AUTH_DOMAIN;
-};
-
 const firebaseConfig = {
-  apiKey: "AIzaSyA6cUdhIJ7vuMrRPJMaVWTWtaIZ7T-0J2U",
-  authDomain: "nutri-vision-704d5.firebaseapp.com",
-  projectId: "nutri-vision-704d5",
-  storageBucket: "nutri-vision-704d5.appspot.com",
-  messagingSenderId: "459313233457",
-  appId: "1:459313233457:web:e8497090f2a65c09c65f10",
-  measurementId: "G-5R7PH6HJ83"
+  apiKey: import.meta.env.VITE_FIREBASE_API_KEY,
+  authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN,
+  projectId: import.meta.env.VITE_FIREBASE_PROJECT_ID,
+  storageBucket: import.meta.env.VITE_FIREBASE_STORAGE_BUCKET,
+  messagingSenderId: import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID,
+  appId: import.meta.env.VITE_FIREBASE_APP_ID,
+  measurementId: import.meta.env.VITE_FIREBASE_MEASUREMENT_ID
 };
 
-// Initialize Firebase
-const app = initializeApp(firebaseConfig);
+// Initialize Firebase with error handling
+let app;
+let auth;
+let db;
+let storage;
+let analytics;
 
-// Initialize Auth
-const auth = getAuth(app);
-
-// Initialize Firestore with persistent cache and better error handling
-const db = initializeFirestore(app, {
-  localCache: persistentLocalCache({
-    tabManager: persistentMultipleTabManager()
-  }),
-  experimentalForceLongPolling: true,
-  ignoreUndefinedProperties: true
-});
-
-// Initialize other Firebase services
-const storage = getStorage(app);
-const analytics = getAnalytics(app);
+try {
+  app = initializeApp(firebaseConfig);
+  console.log('Firebase app initialized successfully');
+  
+  auth = getAuth(app);
+  console.log('Firebase Auth initialized successfully');
+  
+  db = initializeFirestore(app, {
+    localCache: persistentLocalCache({
+      tabManager: persistentMultipleTabManager()
+    }),
+    experimentalForceLongPolling: true,
+    ignoreUndefinedProperties: true
+  });
+  console.log('Firebase Firestore initialized successfully');
+  
+  storage = getStorage(app);
+  console.log('Firebase Storage initialized successfully');
+  
+  analytics = getAnalytics(app);
+  console.log('Firebase Analytics initialized successfully');
+} catch (error) {
+  console.error('Firebase initialization error:', error);
+  // Provide fallback values
+  app = null;
+  auth = null;
+  db = null;
+  storage = null;
+  analytics = null;
+}
 
 // Enhanced write queue with strict rate limiting
 let writeQueue = [];
@@ -133,6 +145,4 @@ const optimizedWrite = async (ref, data, options = {}) => {
   }
 };
 
-// Export Firebase services
-export { auth, db, storage, analytics, optimizedWrite };
-export default app; 
+export { app, auth, db, storage, analytics, optimizedWrite }; 

@@ -1,0 +1,12 @@
+{
+  "name": "nutrivision-scripts",
+  "version": "1.0.0",
+  "description": "Scripts for NutriVision app",
+  "main": "generate-icons.js",
+  "scripts": {
+    "generate-icons": "node generate-icons.js"
+  },
+  "dependencies": {
+    "sharp": "^0.32.1"
+  }
+} 

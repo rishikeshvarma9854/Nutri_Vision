@@ -15,7 +15,7 @@ def get_local_ip():
         return 'localhost'
 
 def create_app():
-    app = Flask(__name__)
+    app = Flask(__name__, static_folder='../dist')
     
     # Get the local IP address
     local_ip = get_local_ip()
@@ -23,11 +23,12 @@ def create_app():
     # Default allowed origins including dynamic IP
     default_origins = [
         'http://localhost:3000',
-        'http://localhost:5000',
+        'https://localhost:3000',
         'https://nutri-vision-704d5.web.app',
         'https://nutri-vision-704d5.firebaseapp.com',
+        'https://nutrivision-zfce.onrender.com',
         f'http://{local_ip}:3000',
-        f'http://{local_ip}:5000'
+        f'https://{local_ip}:3000'
     ]
     
     # Get additional origins from environment variable
@@ -64,11 +65,12 @@ SERVER_CONFIG = {
     'host': '0.0.0.0',  # Listen on all network interfaces
     'port': int(os.getenv('PORT', 5000)),
     'debug': True,
-    'threaded': True  # Enable threading
+    'threaded': True,  # Enable threading
+    'ssl_context': ('cert.pem', 'key.pem') if os.path.exists('cert.pem') and os.path.exists('key.pem') else None
 }
 
 # Model configuration
 MODEL_CONFIG = {
     'confidence_threshold': 0.3,
     'max_detections': 10
-} 
+}

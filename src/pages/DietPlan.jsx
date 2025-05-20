@@ -38,6 +38,7 @@ import { useAuth } from '../contexts/AuthContext';
 import { doc, getDoc, setDoc, serverTimestamp, increment, runTransaction } from 'firebase/firestore';
 import { db } from '../firebase/config';
 import { generateDietRecommendations } from '../firebase/services/aiService';
+import { GoogleGenerativeAI } from '@google/generative-ai';
 import ChatBot from '../components/chat/ChatBot';
 import { useNavigate } from 'react-router-dom';
 
@@ -595,50 +596,87 @@ const fetchUserProfile = async () => {
 
 const generateDietPlan = async (userProfile) => {
   try {
-    // Calculate BMR using Harris-Benedict equation
-    const weight = parseFloat(userProfile.weight);
-    const height = parseFloat(userProfile.height);
-    const age = parseFloat(userProfile.age);
-    const isMale = userProfile.gender.toLowerCase() === 'male';
+    const apiKey = import.meta.env.VITE_GEMINI_API_KEY;
+    if (!apiKey) {
+      throw new Error('Gemini API key is not configured. Please set VITE_GEMINI_API_KEY in your .env file.');
+    }
+
+    const genAI = new GoogleGenerativeAI(apiKey);
+    const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
+
+    const prompt = `Generate a personalized diet plan for a person with the following profile:
+    - Age: ${userProfile.age}
+    - Gender: ${userProfile.gender}
+    - Weight: ${userProfile.weight} kg
+    - Height: ${userProfile.height} cm
+    - Activity Level: ${userProfile.activityLevel}
+    - Goal: ${userProfile.goal}
+    - Dietary Type: ${userProfile.dietaryType}
+    - Allergies: ${userProfile.allergies || 'None'}
+    - Health Conditions: ${userProfile.healthConditions || 'None'}
+
+    Please provide:
+    1. A list of recommended foods that align with their dietary type and goals
+    2. A list of foods to avoid based on their dietary type and any allergies/health conditions
+    3. Make the recommendations specific to their dietary type (e.g., for vegan, only plant-based foods; for keto, low-carb options)
+    4. Consider their activity level and goals when suggesting portion sizes and food types
+
+    Format the response in markdown with clear sections for Recommended Foods and Foods to Avoid.`;
+
+    const result = await model.generateContent(prompt);
+    const response = await result.response;
+    const text = response.text();
     
-    let bmr;
-    if (isMale) {
-      bmr = 88.362 + (13.397 * weight) + (4.799 * height) - (5.677 * age);
+    // Extract recommended foods and foods to avoid from the generated text
+    let recommendedFoods = '';
+    let foodsToAvoid = '';
+
+    // Find the start indices of our sections
+    const recommendedIndex = text.indexOf('### 1. Recommended Foods');
+    const avoidIndex = text.indexOf('### 2. Foods to Avoid');
+    const nextSectionIndex = text.indexOf('### Example Daily Meal Plan');
+
+    if (recommendedIndex !== -1 && avoidIndex !== -1) {
+      // Extract recommended foods (from its header to the next section)
+      recommendedFoods = text.substring(
+        recommendedIndex,
+        avoidIndex
+      ).trim();
+
+      // Extract foods to avoid (from its header to the next section or end)
+      foodsToAvoid = text.substring(
+        avoidIndex,
+        nextSectionIndex !== -1 ? nextSectionIndex : undefined
+      ).trim();
     } else {
-      bmr = 447.593 + (9.247 * weight) + (3.098 * height) - (4.330 * age);
+      // Fallback: try alternative patterns
+      const recommendedMatch = text.match(/Recommended Foods[:\s]+([\s\S]*?)(?=Foods to Avoid|$)/i);
+      const avoidMatch = text.match(/Foods to Avoid[:\s]+([\s\S]*?)(?=###|$)/i);
+
+      if (recommendedMatch) {
+        recommendedFoods = `### Recommended Foods\n${recommendedMatch[1].trim()}`;
+      }
+      if (avoidMatch) {
+        foodsToAvoid = `### Foods to Avoid\n${avoidMatch[1].trim()}`;
+      }
     }
 
-    // Activity level multiplier
-    const activityMultipliers = {
-      'sedentary': 1.2,
-      'lightly_active': 1.375,
-      'moderately_active': 1.55,
-      'very_active': 1.725,
-      'extra_active': 1.9
-    };
-    
-    const activityMultiplier = activityMultipliers[userProfile.activityLevel] || 1.2;
-    let tdee = bmr * activityMultiplier;
-
-    // Adjust calories based on goal
-    let calorieTarget;
-    switch(userProfile.goal) {
-      case 'weight_loss':
-        calorieTarget = tdee - 500; // 500 calorie deficit
-        break;
-      case 'weight_gain':
-        calorieTarget = tdee + 500; // 500 calorie surplus
-        break;
-      default:
-        calorieTarget = tdee; // maintenance
+    // If still no content, use the entire text
+    if (!recommendedFoods && !foodsToAvoid) {
+      recommendedFoods = `### Recommended Foods\n${text}`;
+      foodsToAvoid = '### Foods to Avoid\nNo specific foods to avoid were generated.';
     }
 
-    // Calculate macros
-    const protein = weight * 2; // 2g per kg of body weight
-    const fat = (calorieTarget * 0.25) / 9; // 25% of calories from fat
-    const carbs = (calorieTarget - (protein * 4) - (fat * 9)) / 4; // Remaining calories from carbs
+    console.log('Final Recommended Foods:', recommendedFoods);
+    console.log('Final Foods to Avoid:', foodsToAvoid);
 
-    // Create meal distribution
+    // Calculate nutritional targets
+    const calorieTarget = calculateDailyCalories(userProfile);
+    const protein = calculateProteinTarget(userProfile, calorieTarget);
+    const carbs = calculateCarbTarget(userProfile, calorieTarget);
+    const fat = calculateFatTarget(userProfile, calorieTarget);
+
+    // Calculate meal distribution
     const mealDistribution = {
       breakfast: {
         calories: Math.round(calorieTarget * 0.3),
@@ -665,43 +703,6 @@ const generateDietPlan = async (userProfile) => {
         fats: Math.round(fat * 0.1)
       }
     };
-
-    // Generate diet plan based on dietary type
-    let recommendedFoods = '';
-    let foodsToAvoid = '';
-    
-    if (userProfile.dietaryType === 'vegetarian') {
-      recommendedFoods = `
-## Recommended Foods
-- Protein Sources: Lentils, chickpeas, tofu, tempeh, seitan, Greek yogurt, cottage cheese, eggs
-- Grains: Quinoa, brown rice, oats, whole wheat bread
-- Vegetables: All leafy greens, broccoli, cauliflower, carrots, bell peppers
-- Fruits: Apples, bananas, oranges, berries
-- Healthy Fats: Avocados, nuts, seeds, olive oil`;
-      
-      foodsToAvoid = `
-## Foods to Avoid
-- All meat products
-- Fish and seafood
-- Animal-based gelatin
-- Stock or fats made from meat`;
-    } else {
-      recommendedFoods = `
-## Recommended Foods
-- Lean Proteins: Chicken breast, turkey, fish, lean beef
-- Complex Carbs: Brown rice, quinoa, sweet potatoes, oats
-- Vegetables: Broccoli, spinach, kale, bell peppers
-- Fruits: Apples, berries, oranges, bananas
-- Healthy Fats: Avocados, nuts, olive oil, seeds`;
-      
-      foodsToAvoid = `
-## Foods to Avoid
-- Processed foods
-- Sugary drinks
-- Excessive alcohol
-- Trans fats
-- High-sodium foods`;
-    }
 
     const dietPlan = `
 # Your Personalized Diet Plan
@@ -735,7 +736,11 @@ const generateDietPlan = async (userProfile) => {
 - Calories: ${mealDistribution.snacks.calories} kcal
 - Protein: ${mealDistribution.snacks.protein}g
 - Carbs: ${mealDistribution.snacks.carbs}g
-- Fats: ${mealDistribution.snacks.fats}g`;
+- Fats: ${mealDistribution.snacks.fats}g
+
+${recommendedFoods}
+
+${foodsToAvoid}`;
 
     const generatedPlan = {
       dailyTargets: {

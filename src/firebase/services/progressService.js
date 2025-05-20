@@ -89,30 +89,35 @@ export const updateUserProgress = async (userId, date, mealType, mealData) => {
       if (!mealStatusDoc.exists()) {
         transaction.set(mealStatusRef, {
           [date]: {
-            meals: {
-              breakfast: false,
-              lunch: false,
-              dinner: false,
-              snacks: false,
-              [mealType]: isComplete
-            }
+            breakfast: false,
+            lunch: false,
+            dinner: false,
+            snacks: false,
+            [mealType]: isComplete,
+            lastUpdated: serverTimestamp()
           }
         });
       } else {
         transaction.update(mealStatusRef, {
-          [`${date}.meals.${mealType}`]: isComplete
+          [date]: {
+            ...mealStatusDoc.data()[date],
+            [mealType]: isComplete,
+            lastUpdated: serverTimestamp()
+          }
         });
       }
 
       // 4. Update userStreaks if all meals are complete
       const mealStatusDocAfter = await transaction.get(mealStatusRef);
-      const allMealsComplete = Object.values(mealStatusDocAfter.data()[date]?.meals || {}).every(Boolean);
+      const todayMealStatus = mealStatusDocAfter.data()[date] || {};
+      const allMealsComplete = ['breakfast', 'lunch', 'dinner', 'snacks'].every(meal => todayMealStatus[meal]);
       
       if (allMealsComplete) {
         const streaksRef = doc(db, 'userStreaks', userId);
         const streaksDoc = await transaction.get(streaksRef);
         
         if (!streaksDoc.exists()) {
+          // First time completing all meals
           transaction.set(streaksRef, {
             currentStreak: 1,
             lastCompletedDay: date,
@@ -122,14 +127,27 @@ export const updateUserProgress = async (userId, date, mealType, mealData) => {
             }
           });
         } else {
-          const lastDate = new Date(streaksDoc.data().lastCompletedDay);
+          const streakData = streaksDoc.data();
+          const lastCompletedDay = streakData.lastCompletedDay;
+          
+          // Calculate days between last completion and current date
+          const lastDate = new Date(lastCompletedDay);
           const currentDate = new Date(date);
+          lastDate.setHours(0, 0, 0, 0);
+          currentDate.setHours(0, 0, 0, 0);
+          
           const dayDiff = Math.floor((currentDate - lastDate) / (1000 * 60 * 60 * 24));
           
-          let newStreak = streaksDoc.data().currentStreak;
-          if (dayDiff === 1) {
-            newStreak += 1;
-          } else if (dayDiff > 1) {
+          let newStreak = streakData.currentStreak || 0;
+          
+          if (dayDiff === 0) {
+            // Same day completion - maintain current streak
+            newStreak = streakData.currentStreak;
+          } else if (dayDiff === 1) {
+            // Consecutive day completion - increment streak
+            newStreak = streakData.currentStreak + 1;
+          } else {
+            // Gap in completion - reset streak to 1
             newStreak = 1;
           }
           

@@ -6,6 +6,7 @@ import { LocalizationProvider, DatePicker } from '@mui/x-date-pickers';
 import { format, parseISO, isValid, compareDesc, isToday } from 'date-fns';
 import { db, auth } from '../firebase/config';
 import { collection, query, where, getDocs, addDoc, deleteDoc, doc, getDoc, setDoc, updateDoc } from 'firebase/firestore';
+import { API_ENDPOINTS } from '../utils/api';
 
 const MealLog = () => {
   const [selectedDate, setSelectedDate] = useState(new Date());
@@ -163,6 +164,58 @@ const MealLog = () => {
     return 'snacks';
   };
 
+  const getNutrition = async (foodName) => {
+    try {
+      console.log('Requesting nutrition for:', foodName);
+      const response = await fetch(API_ENDPOINTS.getNutrition, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ foodName })
+      });
+
+      if (!response.ok) {
+        throw new Error('Failed to get nutrition data');
+      }
+
+      const data = await response.json();
+      console.log('Received nutrition response:', data);
+      
+      // Check if we have a valid response with nutrition data
+      if (!data || typeof data !== 'object') {
+        console.error('Invalid response format:', data);
+        throw new Error('Invalid response format');
+      }
+
+      // Handle both direct nutrition data and wrapped response formats
+      let nutrition;
+      if (data.success && data.total) {
+        // Handle wrapped response format
+        nutrition = {
+          calories: Number(data.total.calories) || 0,
+          protein: Number(data.total.protein) || 0,
+          carbs: Number(data.total.carbs) || 0,
+          fats: Number(data.total.fats) || 0
+        };
+      } else {
+        // Handle direct nutrition data format
+        nutrition = {
+          calories: Number(data.calories) || 0,
+          protein: Number(data.protein) || 0,
+          carbs: Number(data.carbs) || 0,
+          fats: Number(data.fats) || 0
+        };
+      }
+
+      console.log('Processed nutrition data:', nutrition);
+      return nutrition;
+    } catch (error) {
+      console.error('Error getting nutrition:', error);
+      throw error;
+    }
+  };
+
   const handleAddMeal = async (mealData) => {
     try {
       if (!auth.currentUser) {
@@ -180,13 +233,16 @@ const MealLog = () => {
       const mealType = determineMealType(timestamp);
       const foodName = mealData.foodItems[0];
 
-      // Get nutrition from Gemini
-      const nutrition = await getNutritionFromGemini(foodName);
+      console.log('Getting nutrition for:', foodName);
+      const nutrition = await getNutrition(foodName);
       
       if (!nutrition) {
+        console.error('No nutrition data received');
         setError('Failed to get nutrition information. Please try again.');
         return;
       }
+
+      console.log('Received nutrition:', nutrition);
 
       const newMeal = {
         foodName: foodName,
@@ -225,58 +281,11 @@ const MealLog = () => {
       // Reset the new meal form
       setNewMeal({ name: '', calories: '', protein: '', carbs: '', fats: '' });
       // Refresh the meals display
-      fetchAllMeals();
+      await fetchAllMeals();
 
     } catch (error) {
       console.error('Error adding meal:', error);
       setError('Failed to add meal: ' + error.message);
-    }
-  };
-
-  // Function to get nutrition information from Gemini
-  const getNutritionFromGemini = async (foodName) => {
-    try {
-      console.log('Getting nutrition for:', foodName);
-      
-      // Get the current host IP
-      const host = window.location.hostname;
-      const isLocalhost = host === 'localhost' || host === '127.0.0.1';
-      const apiUrl = isLocalhost 
-        ? 'http://localhost:5000/get_nutrition'
-        : `http://${host}:5000/get_nutrition`;
-
-      const response = await fetch(apiUrl, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ food_name: foodName })
-      });
-
-      if (!response.ok) {
-        throw new Error('Failed to get nutrition data');
-      }
-
-      const data = await response.json();
-      console.log('Received nutrition data:', data);
-      
-      if (!data.success || !data.total) {
-        throw new Error('Invalid nutrition data received');
-      }
-
-      // Get the nutrition data for the specific food item
-      const foodNutrition = data.items?.[foodName] || data.total;
-
-      return {
-        calories: Math.round(foodNutrition.calories) || 0,
-        protein: Math.round(foodNutrition.protein) || 0,
-        carbs: Math.round(foodNutrition.carbs) || 0,
-        fats: Math.round(foodNutrition.fats) || 0
-      };
-    } catch (error) {
-      console.error('Error getting nutrition from Gemini:', error);
-      // Return null to indicate failure
-      return null;
     }
   };
 

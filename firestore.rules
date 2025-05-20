@@ -16,6 +16,11 @@ service cloud.firestore {
       allow write: if isOwner(userId);
     }
 
+    // Notification settings
+    match /notificationSettings/{userId} {
+      allow read, write: if isOwner(userId);
+    }
+
     // Diet plans
     match /dietPlans/{userId} {
       allow read: if isAuthenticated();
@@ -75,5 +80,17 @@ service cloud.firestore {
     match /{document=**} {
       allow read, write: if false;
     }
+
+    match /users/{userId} {
+      allow read, write: if request.auth != null && request.auth.uid == userId;
+      
+      match /settings/{document=**} {
+        allow read, write: if request.auth != null && request.auth.uid == userId;
+      }
+      
+      match /scheduledNotifications/{document=**} {
+        allow read, write: if request.auth != null && request.auth.uid == userId;
+      }
+    }
   }
-} 
+}

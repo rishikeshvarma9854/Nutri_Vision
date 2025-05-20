@@ -46,6 +46,7 @@ import { useAuth } from '../contexts/AuthContext';
 import * as firebase from 'firebase/app';
 import Calendar from 'react-calendar';
 import { debounce } from 'lodash';
+import { format } from 'date-fns';
 
 const MEAL_ORDER = ['breakfast', 'lunch', 'snacks', 'dinner'];
 const MEAL_TIMES = [
@@ -152,15 +153,13 @@ const updateStreakHistory = async (userId) => {
       currentDate.setDate(currentDate.getDate() + 1);
     }
     
-    // Update Firestore with a batch write to ensure atomicity
-    const batch = writeBatch(db);
-    batch.set(streakRef, {
+    // Update Firestore
+    await setDoc(streakRef, {
       history,
-      lastUpdated: serverTimestamp(),
+      lastUpdated: new Date().toISOString(),
       userId
     }, { merge: true });
     
-    await batch.commit();
     return history;
   } catch (error) {
     console.error('Error updating streak history:', error);
@@ -196,10 +195,8 @@ const batchedFirestoreWrite = debounce(async (userId, updates) => {
 // Add this near the top of the file, after the imports
 const getApiBaseUrl = () => {
   const host = window.location.hostname;
-  const isLocalhost = host === 'localhost' || host === '127.0.0.1';
-  const port = isLocalhost ? '5000' : '443';
-  const protocol = isLocalhost ? 'http' : 'https';
-  return `${protocol}://${host}:${port}`;
+  const port = '3000';
+  return `http://${host}:${port}`;
 };
 
 // Update the API_BASE_URL constant
@@ -209,13 +206,14 @@ const API_BASE_URL = getApiBaseUrl();
 const getServerUrl = () => {
   const host = window.location.hostname;
   const isLocalhost = host === 'localhost' || host === '127.0.0.1';
-  const port = isLocalhost ? '5000' : '443';
-  const protocol = isLocalhost ? 'http' : 'https';
-  return `${protocol}://${host}:${port}`;
+  return isLocalhost 
+    ? 'http://localhost:3000/api'
+    : 'https://nutrivision-oc9q.onrender.com/api';
 };
 
 const Dashboard = () => {
   // State declarations
+  const { currentUser } = useAuth();  // Get currentUser from useAuth
   const [isCameraActive, setIsCameraActive] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
   const [error, setError] = useState(null);
@@ -273,7 +271,6 @@ const Dashboard = () => {
   const [cameraError, setCameraError] = useState(null);
   const [hasCamera, setHasCamera] = useState(false);
   const [cameraPermission, setCameraPermission] = useState('prompt');
-  const { currentUser } = useAuth();
   const videoRef = useRef(null);
   const streamRef = useRef(null);
   const [completedDates, setCompletedDates] = useState([]);
@@ -304,6 +301,46 @@ const Dashboard = () => {
     fats: 0
   });
   const [todayMeals, setTodayMeals] = useState([]);
+
+  // Move initial data fetching to useEffect
+  useEffect(() => {
+    const initializeData = async () => {
+      if (!currentUser) return;
+      
+      try {
+        // Clean up old data before loading new data
+        cleanupOldData();
+        
+        // Fetch historical data
+        const { completed, missed } = await fetchHistoricalData(currentUser.uid);
+        setCompletedDates(completed);
+        setMissedDates(missed);
+
+        // Load today's meal status from Firestore
+        const today = new Date().toISOString().split('T')[0];
+        const progressRef = doc(db, 'userProgress', currentUser.uid);
+        const progressDoc = await getDoc(progressRef);
+        
+        if (progressDoc.exists()) {
+          const todayData = progressDoc.data()[today];
+          if (todayData) {
+            const newMealStatus = {
+              breakfast: todayData.breakfast || false,
+              lunch: todayData.lunch || false,
+              snacks: todayData.snacks || false,
+              dinner: todayData.dinner || false
+            };
+            setMealStatus(newMealStatus);
+          }
+        }
+      } catch (error) {
+        console.error('Error initializing data:', error);
+        setError('Failed to load initial data');
+      }
+    };
+
+    initializeData();
+  }, [currentUser]);
 
   // Fetch diet plan and meals data
   useEffect(() => {
@@ -1104,64 +1141,72 @@ const Dashboard = () => {
     }
   };
 
-  // Update the checkAndUpdateStreak function to handle errors gracefully
-  const checkAndUpdateStreak = async () => {
-    try {
-      if (!auth.currentUser) return;
+  // Add this function to check if a meal meets nutrient targets
+  const isMealTargetMet = (mealProgress, mealTargets) => {
+    if (!mealTargets || !mealProgress) return false;
+    
+    const nutrients = ['calories', 'protein', 'carbs', 'fats'];
+    return nutrients.every(nutrient => {
+      const target = mealTargets[nutrient] || 0;
+      const progress = mealProgress[nutrient] || 0;
+      return target > 0 && (progress / target) >= 0.85;
+    });
+  };
 
+  // Update the useEffect that handles meal status and streak
+  useEffect(() => {
+    const updateStreakOnMealCompletion = async () => {
+      if (!auth.currentUser) return;
+      
       const userId = auth.currentUser.uid;
       const today = new Date().toISOString().split('T')[0];
-      const hour = new Date().getHours();
-
-      if (hour < 0) return;
-
-      const allMealsCompleted = MEAL_ORDER.every(meal => mealStatus[meal]);
-      
-      const streakRef = doc(db, 'userStreaks', userId);
-      let streakDoc;
       
       try {
-        streakDoc = await getDoc(streakRef);
-      } catch (error) {
-        console.error('Error reading streak document:', error);
-        streakDoc = { exists: () => false };
-      }
-      
-      let currentStreak = 0;
-      let history = {};
-      
-      if (streakDoc.exists()) {
-        const data = streakDoc.data();
-        currentStreak = data.currentStreak || 0;
-        history = data.history || {};
-      }
-
-      if (allMealsCompleted) {
-        currentStreak += 1;
-        history[today] = true;
-      } else {
-        currentStreak = 0;
-        history[today] = false;
-      }
-
-      try {
-        await setDoc(streakRef, {
-          currentStreak,
-          history,
-          lastUpdated: new Date().toISOString(),
-          userId
+        // Check if all meals are completed and meet targets
+        const allMealsCompleted = MEAL_ORDER.every(mealType => {
+          const mealProgress = todaysMeals[mealType];
+          const mealTargets = dailyTargets[mealType];
+          return mealProgress && mealTargets && isMealTargetMet(mealProgress, mealTargets);
         });
-
-        setStreak(currentStreak);
-        setDietHistory(history);
+        
+        if (allMealsCompleted) {
+          // Update streak in Firestore
+          const streakRef = doc(db, 'userStreaks', userId);
+          const streakDoc = await getDoc(streakRef);
+          
+          // Get existing history or create new
+          let history = { [today]: true };
+          if (streakDoc.exists()) {
+            const data = streakDoc.data();
+            history = { ...(data.history || {}), [today]: true };
+          }
+          
+          // Calculate streak
+          const currentStreak = calculateStreak(history);
+          
+          // Update Firestore with the new streak
+          await setDoc(streakRef, {
+            currentStreak,
+            history,
+            lastUpdated: new Date().toISOString(),
+            userId
+          }, { merge: true });
+          
+          // Update local state
+          setStreak(currentStreak);
+          
+          // Update completed dates
+          const { completed, missed } = await fetchHistoricalData(userId);
+          setCompletedDates(completed);
+          setMissedDates(missed);
+        }
       } catch (error) {
-        console.error('Error updating streak document:', error);
+        console.error('Error updating streak:', error);
       }
-
-    } catch (error) {
-      console.error('Error in checkAndUpdateStreak:', error);
-    }
-  };
+    };
+    
+    updateStreakOnMealCompletion();
+  }, [todaysMeals, dailyTargets, auth.currentUser]);
 
   const fetchHistoricalStreakData = async () => {
     if (!currentUser) return;
@@ -1336,43 +1381,38 @@ const Dashboard = () => {
     
     // Get all dates and sort them in descending order (most recent first)
     const dates = Object.entries(history)
-      .filter(([_, completed]) => completed === true)
+      .filter(([_, completed]) => completed === true) // Only consider completed days
       .map(([date]) => date)
-      .sort((a, b) => b.localeCompare(a));
+      .sort((a, b) => new Date(b) - new Date(a));
     
     if (dates.length === 0) return 0;
     
-    let streak = 0;
+    let streak = 1; // Start with 1 for the most recent completed day
     const today = new Date();
     today.setHours(0, 0, 0, 0);
     
-    // Convert today to YYYY-MM-DD format
-    const todayStr = today.toISOString().split('T')[0];
+    // Convert most recent date to Date object
+    const mostRecentDate = new Date(dates[0]);
+    mostRecentDate.setHours(0, 0, 0, 0);
     
-    // Start checking from the most recent date
-    for (let i = 0; i < dates.length; i++) {
+    // If the most recent completion is more than 1 day old, streak is broken
+    const daysSinceLastCompletion = Math.floor((today - mostRecentDate) / (1000 * 60 * 60 * 24));
+    if (daysSinceLastCompletion > 1) return 0;
+    
+    // Count consecutive days
+    for (let i = 1; i < dates.length; i++) {
       const currentDate = new Date(dates[i]);
-      currentDate.setHours(0, 0, 0, 0);
-      
-      // If we're checking the first date
-      if (i === 0) {
-        // If the most recent completion is not from today or yesterday, break
-        const daysDiff = Math.floor((today - currentDate) / (1000 * 60 * 60 * 24));
-        if (daysDiff > 1) break;
-        streak = 1;
-        continue;
-      }
-      
-      // Get the previous date to check for consecutive days
       const prevDate = new Date(dates[i - 1]);
-      prevDate.setHours(0, 0, 0, 0);
       
-      // Check if dates are consecutive
-      const daysDiff = Math.floor((prevDate - currentDate) / (1000 * 60 * 60 * 24));
-      if (daysDiff === 1) {
+      // Calculate days difference
+      const diffTime = Math.abs(prevDate - currentDate);
+      const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+      
+      // If dates are consecutive, increment streak
+      if (diffDays === 1) {
         streak++;
       } else {
-        break;
+        break; // Break the streak if days are not consecutive
       }
     }
     
@@ -1485,7 +1525,7 @@ const Dashboard = () => {
         )}
         
         <Typography variant="h6" gutterBottom>
-          Detected Food: {detectedFood.name || detectedFood.foodName}
+          Detected Food: {detectedFood.foodDisplay ? detectedFood.foodDisplay.join(', ') : (detectedFood.name || detectedFood.foodName)}
         </Typography>
 
         <Typography variant="h6" gutterBottom>
@@ -1922,55 +1962,6 @@ const Dashboard = () => {
   // Update the component with the new migrated meals
   fetchAllMeals();
 
-  // Modify the useEffect that monitors mealStatus changes
-  useEffect(() => {
-    let isMounted = true;
-
-    const updateStreakOnMealCompletion = async () => {
-      try {
-        if (!currentUser) return;
-
-        const today = new Date().toISOString().split('T')[0];
-        const streakRef = doc(db, 'userStreaks', currentUser.uid);
-        
-        // Get current streak data
-        const streakDoc = await getDoc(streakRef);
-        let history = {};
-        if (streakDoc.exists()) {
-          history = streakDoc.data().history || {};
-        }
-        
-        // Update today's status
-        history[today] = true;
-        
-        // Use a batch write to ensure atomicity
-        const batch = writeBatch(db);
-        batch.set(streakRef, {
-          history,
-          lastUpdated: serverTimestamp(),
-          userId: currentUser.uid
-        }, { merge: true });
-        
-        await batch.commit();
-        
-        // Update local state
-        setCompletedDates(prev => [...new Set([...prev, today])]);
-        
-        // Recalculate streak
-        const newStreak = calculateStreak(history);
-        setStreak(newStreak);
-      } catch (error) {
-        console.error('Error updating streak:', error);
-      }
-    };
-    
-    updateStreakOnMealCompletion();
-
-    return () => {
-      isMounted = false;
-    };
-  }, [currentUser]);
-
   const clearLocalStorage = async () => {
     try {
       // Clear all localStorage items
@@ -2073,10 +2064,10 @@ const Dashboard = () => {
       backgroundColor: '#e6e6fa'
     },
     '.react-calendar__tile--now': {
-      background: '#ffff76'
+      background: 'none'
     },
     '.react-calendar__tile--now:enabled:hover, .react-calendar__tile--now:enabled:focus': {
-      background: '#ffffa9'
+      background: 'none'
     },
     '.react-calendar__tile--hasActive': {
       background: '#76baff'
@@ -2279,7 +2270,7 @@ const Dashboard = () => {
       formData.append('image', file);
 
       // First, detect all food items in the image
-      const detectionResponse = await fetch(`${getServerUrl()}/detect`, {
+      const detectionResponse = await fetch('https://nutrivision-oc9q.onrender.com/api/detect', {
         method: 'POST',
         body: formData
       });
@@ -2297,6 +2288,7 @@ const Dashboard = () => {
 
       // Get nutrition data for all detected food items
       const foodItems = detectionData.foodItems;
+      const foodQuantities = detectionData.quantities || foodItems.map(() => 1);
       let totalNutrition = {
         calories: 0,
         protein: 0,
@@ -2305,15 +2297,18 @@ const Dashboard = () => {
       };
 
       const detectedFoodNames = [];
+      const detectedFoodDisplay = [];
 
       // Process each detected food item
-      for (const foodName of foodItems) {
-        const nutritionResponse = await fetch(`${getServerUrl()}/get_nutrition`, {
+      for (let i = 0; i < foodItems.length; i++) {
+        const foodName = foodItems[i];
+        const quantity = foodQuantities[i] || 1;
+        const nutritionResponse = await fetch('https://nutrivision-oc9q.onrender.com/api/get_nutrition', {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
           },
-          body: JSON.stringify({ food_name: foodName })
+          body: JSON.stringify({ foodName })
         });
         
         if (!nutritionResponse.ok) {
@@ -2324,13 +2319,14 @@ const Dashboard = () => {
         const nutritionData = await nutritionResponse.json();
         console.log(`Nutrition data for ${foodName}:`, nutritionData);
 
-        // Add to total nutrition values
-        totalNutrition.calories += Number(nutritionData.total?.calories || nutritionData.calories || 0);
-        totalNutrition.protein += Number(nutritionData.total?.protein || nutritionData.protein || 0);
-        totalNutrition.carbs += Number(nutritionData.total?.carbs || nutritionData.carbs || 0);
-        totalNutrition.fats += Number(nutritionData.total?.fats || nutritionData.fats || 0);
+        // Add to total nutrition values (multiply by quantity)
+        totalNutrition.calories += quantity * Number(nutritionData.total?.calories || nutritionData.calories || 0);
+        totalNutrition.protein += quantity * Number(nutritionData.total?.protein || nutritionData.protein || 0);
+        totalNutrition.carbs += quantity * Number(nutritionData.total?.carbs || nutritionData.carbs || 0);
+        totalNutrition.fats += quantity * Number(nutritionData.total?.fats || nutritionData.fats || 0);
         
         detectedFoodNames.push(foodName);
+        detectedFoodDisplay.push(quantity > 1 ? `${quantity} x ${foodName}` : foodName);
       }
 
       // Round the total nutrition values
@@ -2345,12 +2341,14 @@ const Dashboard = () => {
 
       // Create the meal data object with combined data
       const mealData = {
-        foodName: detectedFoodNames.join(', '),
-        name: detectedFoodNames.join(', '),
+        foodName: detectedFoodDisplay.join(', '),
+        name: detectedFoodDisplay.join(', '),
         nutrition: totalNutrition,
         imageUrl: URL.createObjectURL(file),
         timestamp: new Date().toISOString(),
-        foodItems: detectedFoodNames // Store individual food items
+        foodItems: detectedFoodNames, // Store individual food items
+        foodQuantities: foodQuantities,
+        foodDisplay: detectedFoodDisplay
       };
 
       // Set the detected food for display
@@ -2359,7 +2357,7 @@ const Dashboard = () => {
       // Show success message with all detected items
       setSnackbar({
         open: true,
-        message: `Detected: ${detectedFoodNames.join(', ')}. Logging meal...`,
+        message: `Detected: ${detectedFoodDisplay.join(', ')}. Logging meal...`,
         severity: 'info'
       });
 
@@ -2370,7 +2368,7 @@ const Dashboard = () => {
 
     } catch (error) {
       console.error('Error processing image:', error);
-      setError(error.message);
+      setError('Failed to process image. Please try again.');
       setSnackbar({
         open: true,
         message: error.message,
@@ -2426,65 +2424,97 @@ const Dashboard = () => {
   // Update the useEffect that syncs calendar with streak data
   useEffect(() => {
     const syncCalendarData = async () => {
-      if (!auth.currentUser) return;
+      if (!currentUser) return;
       
       try {
-        // Set up real-time listener for streak updates
-        const streakRef = doc(db, 'userStreaks', auth.currentUser.uid);
-        const unsubscribe = onSnapshot(streakRef, (doc) => {
-          if (doc.exists()) {
-            const data = doc.data();
-            const history = data.history || {};
-            
-            // Calculate current streak from history
-            const currentStreak = calculateStreak(history);
-            setStreak(currentStreak);
-            
-            // Update calendar data
-            const completed = [];
-            const missed = [];
-            
-            // Process all dates
-            const today = new Date();
-            today.setHours(0, 0, 0, 0);
-            
-            Object.entries(history).forEach(([date, status]) => {
-              const entryDate = new Date(date);
-              entryDate.setHours(0, 0, 0, 0);
-              
-              // Only process dates up to today
-              if (entryDate <= today) {
-                if (status === true) {
-                  completed.push(date);
-                } else {
-                  missed.push(date);
-                }
-              }
-            });
-            
-            // Sort the arrays chronologically
-            completed.sort();
-            missed.sort();
-            
-            // Update calendar states
-            setCompletedDates(completed);
-            setMissedDates(missed);
-            
-            // Remove redundant console logs and keep only one essential update
-            if (process.env.NODE_ENV === 'development') {
-              console.log(`Streak data updated: ${currentStreak} day streak`);
-            }
+        const streakRef = doc(db, 'userStreaks', currentUser.uid);
+        const mealStatusRef = doc(db, 'userMealStatus', currentUser.uid);
+        
+        // Get meal status data
+        const mealStatusDoc = await getDoc(mealStatusRef);
+        const mealStatusData = mealStatusDoc.exists() ? mealStatusDoc.data() : {};
+        
+        // Create history object from meal status data
+        const history = {};
+        Object.entries(mealStatusData).forEach(([date, status]) => {
+          if (typeof status === 'object') {
+            // Check if all meals are complete for the day
+            const allComplete = ['breakfast', 'lunch', 'dinner', 'snacks']
+              .every(meal => status[meal] === true);
+            history[date] = allComplete;
           }
         });
-
-        return () => unsubscribe();
+        
+        // Calculate streak
+        const currentStreak = calculateStreak(history);
+        
+        // Update Firestore and local state
+        await setDoc(streakRef, {
+          currentStreak,
+          history,
+          lastUpdated: serverTimestamp()
+        }, { merge: true });
+        
+        setStreak(currentStreak);
+        
+        // Update calendar data
+        const completed = Object.entries(history)
+          .filter(([_, status]) => status === true)
+          .map(([date]) => date);
+        
+        const missed = Object.entries(history)
+          .filter(([_, status]) => status === false)
+          .map(([date]) => date);
+        
+        setCompletedDates(completed);
+        setMissedDates(missed);
+        
       } catch (error) {
         console.error('Error in calendar sync:', error);
       }
     };
 
     syncCalendarData();
-  }, [auth.currentUser]);
+  }, [currentUser]);
+
+  useEffect(() => {
+    const fetchStreak = async () => {
+      if (!currentUser?.uid) return;
+      
+      try {
+        const streakDoc = await getDoc(doc(db, 'userStreaks', currentUser.uid));
+        if (streakDoc.exists()) {
+          const streakData = streakDoc.data();
+          setStreak(streakData.currentStreak || 0);
+          
+          // Check if all meals are complete for today
+          const today = format(new Date(), 'yyyy-MM-dd');
+          const mealStatusDoc = await getDoc(doc(db, 'userMealStatus', currentUser.uid));
+          
+          if (mealStatusDoc.exists()) {
+            const todayMealStatus = mealStatusDoc.data()[today] || {};
+            const allMealsComplete = ['breakfast', 'lunch', 'dinner', 'snacks']
+              .every(meal => todayMealStatus[meal]);
+            
+            if (allMealsComplete && streakData.lastCompletedDay !== today) {
+              // Update streak for today's completion if not already updated
+              await updateDoc(doc(db, 'userStreaks', currentUser.uid), {
+                currentStreak: streakData.currentStreak + 1,
+                lastCompletedDay: today,
+                lastUpdated: serverTimestamp(),
+                [`history.${today}`]: true
+              });
+              setStreak(streakData.currentStreak + 1);
+            }
+          }
+        }
+      } catch (error) {
+        console.error('Error fetching streak:', error);
+      }
+    };
+
+    fetchStreak();
+  }, [currentUser?.uid]);
 
   // Remove the loading check before the return statement and integrate it into the component
   return (
@@ -2653,60 +2683,6 @@ const Dashboard = () => {
                     </Box>
                   ))}
                 </Box>
-                
-                {/* Display last sync info */}
-                <Box sx={{ mt: 1, mb: 1 }}>
-                  <Typography variant="body2" sx={{ color: 'text.secondary', fontSize: '0.85rem', mb: 1 }}>
-                    {localStorage.getItem('migrationCompleted') 
-                      ? 'Meal data synced in this session' 
-                      : 'No meal sync performed yet'}
-                  </Typography>
-                </Box>
-                
-                {/* Add action buttons */}
-                <Stack direction="row" spacing={2} justifyContent="center" sx={{ mt: 1 }}>
-                  {/* Sync Missing Meals button */}
-                  <Button 
-                    variant="outlined"
-                    color="primary"
-                    startIcon={<RestaurantIcon />}
-                    onClick={() => {
-                      if (auth.currentUser) {
-                        migrationCompletedRef.current = false;
-                        localStorage.removeItem('migrationCompleted');
-                        migrateMealsFromProgress(auth.currentUser.uid);
-                      }
-                    }}
-                    size="small"
-                    disabled={loading}
-                  >
-                    Sync Meals
-                  </Button>
-                  
-                  {/* Recalculate Streak button */}
-                  <Button 
-                    variant="outlined"
-                    color="secondary"
-                    startIcon={<FireIcon />}
-                    onClick={recalculateStreak}
-                    size="small"
-                    disabled={loading}
-                  >
-                    Fix Streak
-                  </Button>
-                  
-                  {/* Clear Cache button */}
-                  <Button 
-                    variant="outlined"
-                    color="error"
-                    startIcon={<DeleteIcon />}
-                    onClick={clearCache}
-                    size="small"
-                    disabled={loading}
-                  >
-                    Clear Cache
-                  </Button>
-                </Stack>
               </Box>
             </CardContent>
           </Card>

@@ -1,10 +1,6 @@
 [
   {
-    "origin": [
-      "http://localhost:3000",
-      "https://nutri-vision-704d5.web.app",
-      "https://nutri-vision-704d5.firebaseapp.com"
-    ],
+    "origin": ["http://localhost:3000"],
     "method": ["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD"],
     "maxAgeSeconds": 3600,
     "responseHeader": [

@@ -1,0 +1,11 @@
+{
+  "name": "nutri-vision",
+  "type": "web",
+  "env": "docker",
+  "dockerfilePath": "./Dockerfile",
+  "envVars": {
+    "NODE_ENV": "production",
+    "VITE_API_URL": "https://nutrivision-zfce.onrender.com",
+    "VITE_BACKEND_URL": "https://nutrivision-zfce.onrender.com:3000"
+  }
+} 

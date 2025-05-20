@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: nutri-vision
+    env: docker
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: VITE_API_URL
+        value: https://nutrivision-zfce.onrender.com
+      - key: VITE_BACKEND_URL
+        value: https://nutrivision-zfce.onrender.com:3000
+      - key: VITE_FIREBASE_API_KEY
+        value: AIzaSyC4QYQJQYQJQYQJQYQJQYQJQYQJQYQJQYQ
+      - key: VITE_FIREBASE_AUTH_DOMAIN
+        value: nutri-vision-704d5.firebaseapp.com
+      - key: VITE_FIREBASE_PROJECT_ID
+        value: nutri-vision-704d5
+      - key: VITE_FIREBASE_STORAGE_BUCKET
+        value: nutri-vision-704d5.appspot.com
+      - key: VITE_FIREBASE_MESSAGING_SENDER_ID
+        value: 123456789012
+      - key: VITE_FIREBASE_APP_ID
+        value: 1:123456789012:web:abcdef1234567890
+      - key: VITE_FIREBASE_MEASUREMENT_ID
+        value: G-ABCDEF1234 

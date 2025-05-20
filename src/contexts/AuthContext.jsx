@@ -1,6 +1,7 @@
 import React, { createContext, useContext, useState, useEffect } from 'react';
 import { auth } from '../firebase/config';
 import { onAuthStateChanged } from 'firebase/auth';
+import { Box, CircularProgress } from '@mui/material';
 
 const AuthContext = createContext();
 
@@ -26,9 +27,26 @@ export function AuthProvider({ children }) {
     loading
   };
 
+  if (loading) {
+    return (
+      <Box
+        sx={{
+          height: '100vh',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          background: 'url(/images/healthy-food-bg.jpg) no-repeat center center fixed',
+          backgroundSize: 'cover',
+        }}
+      >
+        <CircularProgress />
+      </Box>
+    );
+  }
+
   return (
     <AuthContext.Provider value={value}>
-      {!loading && children}
+      {children}
     </AuthContext.Provider>
   );
 } 

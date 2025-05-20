@@ -20,18 +20,21 @@ import {
   Restaurant as RestaurantIcon,
   AccessTime as AccessTimeIcon,
   Warning as WarningIcon,
-  LocalHospital as MedicalIcon
+  LocalHospital as MedicalIcon,
+  Notifications as NotificationsIcon
 } from '@mui/icons-material';
 import { db, auth } from '../firebase/config';
 import { doc, getDoc, updateDoc, setDoc } from 'firebase/firestore';
+import NotificationSettings from '../components/NotificationSettings';
 
 const dietaryTypes = [
   'Omnivore',
   'Vegetarian',
   'Vegan',
-  'Pescatarian',
-  'Keto',
-  'Paleo'
+  'Pescatarian(no meat expect seafoods)',
+  'Keto(low carb, high fat)',
+  'Paleo(no grains, legumes, processed foods)',
+  'Mediterranean(lots of fruits, vegetables, whole grains, fish, olive oil)'
 ];
 
 const genderOptions = [
@@ -179,7 +182,7 @@ const Profile = () => {
   }
 
   return (
-    <Container maxWidth="lg" sx={{ py: 4 }}>
+    <Container maxWidth="lg" sx={{ mt: 4, mb: 4 }}>
       <Box sx={{ mb: 4, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
         <Typography variant="h4">Profile Settings</Typography>
         <Button
@@ -415,6 +418,17 @@ const Profile = () => {
               </Grid>
             </CardContent>
           </Card>
+        </Grid>
+
+        {/* Notification Settings Section */}
+        <Grid item xs={12}>
+          <Box sx={{ mb: 3 }}>
+            <Typography variant="h4" gutterBottom display="flex" alignItems="center">
+              <NotificationsIcon sx={{ mr: 1 }} />
+              Notifications
+            </Typography>
+            <NotificationSettings />
+          </Box>
         </Grid>
       </Grid>
     </Container>

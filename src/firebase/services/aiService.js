@@ -3,7 +3,7 @@ import { doc, setDoc, collection, addDoc, serverTimestamp } from 'firebase/fires
 import { GoogleGenerativeAI } from '@google/generative-ai';
 
 // Get API key from environment variables
-const API_KEY = import.meta.env.VITE_HUGGING_FACE_API_KEY;
+const API_KEY = "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"; // Using the key directly for now
 const API_URL = "https://api-inference.huggingface.co/models/gpt2";
 
 // Add API key validation
@@ -12,7 +12,15 @@ if (!API_KEY) {
   console.warn('Hugging Face API key is not configured.');
 }
 
-const genAI = new GoogleGenerativeAI(import.meta.env.VITE_GEMINI_API_KEY);
+// Use environment variable for Gemini API key
+const GEMINI_API_KEY = import.meta.env.VITE_GEMINI_API_KEY;
+if (!GEMINI_API_KEY) {
+  console.error('Gemini API key is not configured. Please set VITE_GEMINI_API_KEY in your .env file.');
+  throw new Error('Gemini API key is not configured');
+}
+
+const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
+const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
 
 // Generate content using Hugging Face API
 const generateContent = async (prompt) => {
@@ -157,7 +165,7 @@ const storeAIInteraction = async (userId, type, prompt, response) => {
 // Generate diet recommendations
 export const generateDietRecommendations = async (userProfile, dietPlan) => {
   try {
-    const model = genAI.getGenerativeModel({ model: "gemini-pro" });
+    const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
 
     const prompt = `Generate personalized food recommendations based on the following user profile and diet plan:
 

@@ -13,9 +13,11 @@ import {
   Avatar,
   Alert,
 } from '@mui/material';
-import ChatIcon from '@mui/icons-material/Chat';
-import CloseIcon from '@mui/icons-material/Close';
-import SendIcon from '@mui/icons-material/Send';
+import {
+  Chat as ChatIcon,
+  Close as CloseIcon,
+  Send as SendIcon,
+} from '@mui/icons-material';
 import { auth, db } from '../../firebase/config';
 import { doc, getDoc, setDoc, collection, query, where, orderBy, limit, getDocs, addDoc, serverTimestamp, writeBatch } from 'firebase/firestore';
 import { useAuth } from '../../contexts/AuthContext';

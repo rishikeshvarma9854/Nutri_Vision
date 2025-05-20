@@ -45,21 +45,21 @@ const dietaryTypes = [
   { value: 'omnivore', label: 'Omnivore (Everything)' },
   { value: 'vegetarian', label: 'Vegetarian' },
   { value: 'vegan', label: 'Vegan' },
-  { value: 'pescatarian', label: 'Pescatarian' },
-  { value: 'keto', label: 'Ketogenic' },
-  { value: 'paleo', label: 'Paleo' },
-  { value: 'mediterranean', label: 'Mediterranean' },
+  { value: 'pescatarian', label: 'Pescatarian(no meat expect seafoods)' },
+  { value: 'keto', label: 'Ketogenic(low carb, high fat)' },
+  { value: 'paleo(no grains, legumes, processed foods)', label: 'Paleo(no grains, legumes, processed foods)' },
+  { value: 'mediterranean', label: 'Mediterranean(lots of fruits, vegetables, whole grains, fish, olive oil)' },
   { value: 'other', label: 'Other (Specify in notes)' }
 ];
 
 const commonAllergies = [
   'Milk', 'Eggs', 'Fish', 'Shellfish', 'Tree Nuts', 
-  'Peanuts', 'Wheat', 'Soy', 'Other'
+  'Peanuts', 'Wheat', 'Soy', 'Other', 'none'
 ];
 
 const commonConditions = [
   'Diabetes', 'Hypertension', 'Celiac Disease', 'Lactose Intolerance',
-  'IBS', 'GERD', 'Other'
+  'IBS', 'GERD', 'Other', 'none'
 ];
 
 const goals = [
