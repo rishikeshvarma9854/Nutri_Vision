@@ -110,11 +110,7 @@ The application uses Google's Gemini AI to:
 4. Push to the branch (`git push origin feature/amazing-feature`)
 5. Open a Pull Request
 
-## License
-
-This project is made by 2nd-year students of  KMIT as a Real-time Research Project by the
-
-## Team Sainz
+## Real-time Research Project by the Team Sainz
 
 - 🧠 Vineel Yerubandi — Team Lead & Database designer
    - Led the team and played a key role in training the AI model & in creating the Database design.
@@ -126,3 +122,5 @@ This project is made by 2nd-year students of  KMIT as a Real-time Research Proje
    - Handled the backend systems and collaborated in data collection, preprocessing, and labeling.
 - 💻 Satyadeva — Frontend Developer & Tester
    - Built the frontend interface and conducted rigorous testing of the application to ensure quality.
+ 
+###### Done by 2nd Year Students of KMIT
