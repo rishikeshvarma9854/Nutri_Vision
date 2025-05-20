@@ -110,6 +110,10 @@ The application uses Google's Gemini AI to:
 4. Push to the branch (`git push origin feature/amazing-feature`)
 5. Open a Pull Request
 
+## Deployment
+
+This site is deployed in render using docker you can access this site at https://nutrivision-0c9q.onrender.com
+
 ## Real-time Research Project by the Team Sainz
 
 - 🧠 Vineel Yerubandi — Team Lead & Database designer
