@@ -112,7 +112,7 @@ The application uses Google's Gemini AI to:
 
 ## Deployment
 
-This site is deployed in render using docker you can access this site at https://nutrivision-0c9q.onrender.com
+This site is deployed in render using docker you can access this site at https://nutrivision-oc9q.onrender.com
 
 ## Real-time Research Project by the Team Sainz
 
