@@ -1,7 +1,7 @@
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 
 // Initialize Gemini
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || 'AIzaSyBS--qFPRpUxyf1MQBcq2I0Gb8GRW7iUrk');
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || 'replace with your key');
 const model = genAI.getGenerativeModel({ model: "gemini-pro-vision" });
 
 // Food detection function
