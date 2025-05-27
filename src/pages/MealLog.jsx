@@ -1,8 +1,8 @@
 import React, { useState, useEffect } from 'react';
-import { Box, Typography, Card, CardContent, Grid, Button, CircularProgress, IconButton, Dialog, DialogTitle, DialogContent, DialogActions, TextField, Stack, Divider, Alert } from '@mui/material';
+import { Box, Typography, Card, CardContent, Grid, Button, CircularProgress, IconButton, Dialog, DialogTitle, DialogContent, DialogActions, TextField, Stack, Divider, Alert, MenuItem } from '@mui/material';
 import { Add as AddIcon, Delete as DeleteIcon, Today as TodayIcon, ExpandMore as ExpandMoreIcon } from '@mui/icons-material';
 import { AdapterDateFns } from '@mui/x-date-pickers/AdapterDateFns';
-import { LocalizationProvider, DatePicker } from '@mui/x-date-pickers';
+import { LocalizationProvider, DatePicker, TimePicker } from '@mui/x-date-pickers';
 import { format, parseISO, isValid, compareDesc, isToday } from 'date-fns';
 import { db, auth } from '../firebase/config';
 import { collection, query, where, getDocs, addDoc, deleteDoc, doc, getDoc, setDoc, updateDoc } from 'firebase/firestore';
@@ -18,7 +18,9 @@ const MealLog = () => {
     calories: '',
     protein: '',
     carbs: '',
-    fats: ''
+    fats: '',
+    mealType: 'breakfast',
+    time: new Date()
   });
   const [error, setError] = useState('');
   const [sortOrder, setSortOrder] = useState('desc'); // 'asc' or 'desc'
@@ -229,8 +231,9 @@ const MealLog = () => {
       }
 
       const userId = auth.currentUser.uid;
-      const timestamp = new Date().toISOString();
-      const mealType = determineMealType(timestamp);
+      const selectedTime = newMeal.time;
+      const timestamp = selectedTime.toISOString();
+      const mealType = newMeal.mealType;
       const foodName = mealData.foodItems[0];
 
       console.log('Getting nutrition for:', foodName);
@@ -244,7 +247,7 @@ const MealLog = () => {
 
       console.log('Received nutrition:', nutrition);
 
-      const newMeal = {
+      const newMealData = {
         foodName: foodName,
         name: foodName,
         foodItems: mealData.foodItems,
@@ -256,7 +259,7 @@ const MealLog = () => {
         userId: userId
       };
 
-      console.log('Adding new meal with nutrition:', newMeal);
+      console.log('Adding new meal with nutrition:', newMealData);
 
       const dateKey = format(selectedDate, 'yyyy-MM-dd');
       const mealRef = doc(db, 'userMeals', userId);
@@ -266,11 +269,11 @@ const MealLog = () => {
         const existingData = mealDoc.data();
         const existingMeals = existingData[dateKey] || [];
         await updateDoc(mealRef, {
-          [dateKey]: [...existingMeals, newMeal]
+          [dateKey]: [...existingMeals, newMealData]
         });
       } else {
         await setDoc(mealRef, {
-          [dateKey]: [newMeal]
+          [dateKey]: [newMealData]
         });
       }
 
@@ -279,7 +282,15 @@ const MealLog = () => {
       // Close the dialog
       setOpenDialog(false);
       // Reset the new meal form
-      setNewMeal({ name: '', calories: '', protein: '', carbs: '', fats: '' });
+      setNewMeal({ 
+        name: '', 
+        calories: '', 
+        protein: '', 
+        carbs: '', 
+        fats: '', 
+        mealType: 'breakfast',
+        time: new Date() 
+      });
       // Refresh the meals display
       await fetchAllMeals();
 
@@ -289,7 +300,7 @@ const MealLog = () => {
     }
   };
 
-  const deleteMeal = async (date, mealIndex) => {
+  const deleteMeal = async (date, mealId) => {
     try {
       if (!auth.currentUser) return;
 
@@ -300,13 +311,22 @@ const MealLog = () => {
       if (mealDoc.exists()) {
         const data = mealDoc.data();
         const mealsForDate = [...(data[date] || [])];
+        
+        // Find the index of the meal with matching ID
+        const mealIndex = mealsForDate.findIndex(meal => {
+          // Check both id and foodName to ensure we find the correct meal
+          return meal.id === mealId || (meal.foodName === mealId);
+        });
+        
+        if (mealIndex !== -1) {
         mealsForDate.splice(mealIndex, 1);
         
         await updateDoc(mealRef, {
           [date]: mealsForDate
         });
 
-        fetchAllMeals();
+          await fetchAllMeals();
+        }
       }
     } catch (error) {
       console.error('Error deleting meal:', error);
@@ -344,9 +364,11 @@ const MealLog = () => {
     return Object.keys(allMeals)
       .filter(date => isValid(parseISO(date)))
       .sort((a, b) => {
+        const dateA = parseISO(a);
+        const dateB = parseISO(b);
         return sortOrder === 'desc' 
-          ? parseISO(b) - parseISO(a) 
-          : parseISO(a) - parseISO(b);
+          ? dateB.getTime() - dateA.getTime()
+          : dateA.getTime() - dateB.getTime();
       });
   };
 
@@ -367,10 +389,25 @@ const MealLog = () => {
       );
     }
 
-    // Sort dates from newest to oldest
-    const sortedDates = Object.keys(allMeals)
+    // Filter dates based on selected date
+    const selectedDateStr = format(selectedDate, 'yyyy-MM-dd');
+    const datesToShow = Object.keys(allMeals).filter(date => {
+      // If no date is selected, show all dates
+      if (!selectedDate) return true;
+      // Otherwise, only show the selected date
+      return date === selectedDateStr;
+    });
+
+    // Sort the filtered dates using getSortedDates
+    const sortedDates = datesToShow
       .filter(date => isValid(parseISO(date)))
-      .sort((a, b) => compareDesc(parseISO(a), parseISO(b)));
+      .sort((a, b) => {
+        const dateA = parseISO(a);
+        const dateB = parseISO(b);
+        return sortOrder === 'desc' 
+          ? dateB.getTime() - dateA.getTime()
+          : dateA.getTime() - dateB.getTime();
+      });
 
     const mealTypeOrder = ['breakfast', 'lunch', 'snacks', 'dinner'];
 
@@ -393,7 +430,9 @@ const MealLog = () => {
             
             // Then sort by timestamp
             if (a.timestamp && b.timestamp) {
-              return new Date(a.timestamp) - new Date(b.timestamp);
+              const timeA = new Date(a.timestamp).getTime();
+              const timeB = new Date(b.timestamp).getTime();
+              return timeA - timeB;
             }
             
             return 0;
@@ -468,8 +507,8 @@ const MealLog = () => {
                     </Typography>
                     
                     <Grid container spacing={2}>
-                      {mealsOfType.map((meal, index) => (
-                        <Grid item xs={12} sm={6} md={4} key={`${meal.id || index}-${meal.name}`}>
+                      {mealsOfType.map((meal) => (
+                        <Grid item xs={12} sm={6} md={4} key={`${date}-${meal.foodName || meal.name}`}>
                           <Card sx={{ 
                             height: '100%', 
                             boxShadow: 2,
@@ -487,7 +526,7 @@ const MealLog = () => {
                                 <IconButton 
                                   size="small" 
                                   color="error" 
-                                  onClick={() => deleteMeal(date, index)}
+                                  onClick={() => deleteMeal(date, meal.foodName || meal.name)}
                                   sx={{ ml: 1, p: 0.5 }}
                                 >
                                   <DeleteIcon fontSize="small" />
@@ -541,8 +580,13 @@ const MealLog = () => {
 
   return (
     <Box sx={{ p: 3 }}>
-      <Stack direction="row" spacing={2} alignItems="center" mb={3}>
-        <Typography variant="h4">Meal Log</Typography>
+      <Typography variant="h4" sx={{ mb: 3 }}>Meal Log</Typography>
+      
+      <Stack direction="row" spacing={2} alignItems="flex-end" mb={3}>
+        <Box>
+          <Typography variant="body2" color="text.primary" sx={{ mb: 1, fontWeight: 500 }}>
+            Sort by date
+          </Typography>
         <LocalizationProvider dateAdapter={AdapterDateFns}>
           <DatePicker
             value={selectedDate}
@@ -550,18 +594,14 @@ const MealLog = () => {
             slotProps={{ textField: { size: "small" } }}
           />
         </LocalizationProvider>
+        </Box>
         <Button
           variant="contained"
           startIcon={<AddIcon />}
           onClick={() => setOpenDialog(true)}
+          sx={{ height: 40 }}
         >
           Add Meal
-        </Button>
-        <Button
-          variant="outlined"
-          onClick={() => setSortOrder(prev => prev === 'desc' ? 'asc' : 'desc')}
-        >
-          Sort {sortOrder === 'desc' ? 'Oldest First' : 'Newest First'}
         </Button>
       </Stack>
 
@@ -577,13 +617,36 @@ const MealLog = () => {
               value={newMeal?.name || ''}
               onChange={(e) => setNewMeal(prev => ({ ...prev, name: e.target.value }))}
             />
+            <TextField
+              select
+              label="Meal Type"
+              fullWidth
+              value={newMeal?.mealType || 'breakfast'}
+              onChange={(e) => setNewMeal(prev => ({ ...prev, mealType: e.target.value }))}
+            >
+              <MenuItem value="breakfast">Breakfast</MenuItem>
+              <MenuItem value="lunch">Lunch</MenuItem>
+              <MenuItem value="dinner">Dinner</MenuItem>
+              <MenuItem value="snacks">Snacks</MenuItem>
+            </TextField>
+            <LocalizationProvider dateAdapter={AdapterDateFns}>
+              <TimePicker
+                label="Meal Time"
+                value={newMeal?.time || new Date()}
+                onChange={(newTime) => setNewMeal(prev => ({ ...prev, time: newTime }))}
+                renderInput={(params) => <TextField {...params} fullWidth />}
+              />
+            </LocalizationProvider>
           </Stack>
         </DialogContent>
         <DialogActions>
           <Button onClick={() => setOpenDialog(false)}>Cancel</Button>
           <Button 
             onClick={() => {
-              handleAddMeal({ foodItems: [newMeal?.name] });
+              handleAddMeal({ 
+                foodItems: [newMeal?.name],
+                mealType: newMeal?.mealType 
+              });
               setOpenDialog(false);
             }} 
             variant="contained"
