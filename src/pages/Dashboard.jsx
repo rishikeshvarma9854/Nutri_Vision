@@ -2643,7 +2643,7 @@ const Dashboard = () => {
                 pb: 1,
                 mb: 2
               }}>
-                Streak Information
+                Instructions
               </Typography>
               <Box sx={{ 
                 display: 'flex',
@@ -2654,7 +2654,7 @@ const Dashboard = () => {
                 borderRadius: 1
               }}>
                 <Typography variant="body1" sx={{ fontWeight: 500, color: 'text.primary' }}>
-                  Keep up the great work! Track your meals daily to maintain your streak.
+                  You're doing great! Keep tracking your meals, stay on your streak, and build a healthier you!.
                 </Typography>
                 <Box sx={{ 
                   display: 'flex',
@@ -2663,10 +2663,14 @@ const Dashboard = () => {
                   mt: 1
                 }}>
                   {[
-                    'Complete all meals to increase your streak',
-                    'Streak resets if you miss any meal',
-                    'Green dates indicate successful diet days',
-                    'Red dates indicate missed diet goals'
+                    'Generate your personalized diet plan after completing onboarding',
+                    'Reload or reopen the page if detection fails, and check your internet connection',
+                    'Log meals daily in the Meal Log to maintain consistency',
+                    'Track your calorie and meal history in the Progress page with visual charts',
+                    'Update your weight monthly in the Profile page to keep your diet plan accurate',
+                    'Use the chatbot to ask health or nutrition questions anytime',
+                    'The Dashboard shows your current streak, recent meals nutrition values, and quick stats',
+                    'Stick to your meal schedule daily to grow your health streak'
                   ].map((text, index) => (
                     <Box key={index} sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
                       <Box
