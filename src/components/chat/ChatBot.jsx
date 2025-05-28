@@ -508,7 +508,7 @@ const ChatBot = ({ context = 'general' }) => {
               borderColor: 'divider',
             }}
           >
-            <Typography variant="h6">Nutrition Assistant</Typography>
+            <Typography variant="h6">Nuitron</Typography>
             <IconButton size="small" onClick={() => setIsOpen(false)}>
               <CloseIcon />
             </IconButton>
@@ -526,7 +526,7 @@ const ChatBot = ({ context = 'general' }) => {
           >
             {messages.length === 0 && !loading && (
               <Typography color="text.secondary" align="center">
-                Start a conversation with your nutrition assistant!
+                Start a conversation with your Nuitron Assistant!
               </Typography>
             )}
             
