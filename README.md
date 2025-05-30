@@ -118,9 +118,9 @@ This site is deployed in render using docker you can access this site at https:/
 
 - 🧠 Vineel Yerubandi — Team Lead & Database designer
    - Led the team and played a key role in training the AI model & in creating the Database design.
-- 🤖 K. Sri Rishikesh Varma — AI Developer
+- 🤖 K. Sri Rishikesh Varma — AI Developer & Backend Developer
    - Developed the AI model and implemented its integration with the backend system.
-- 🎨 Kota Shiva Tarak Reddy — UI Designer & Data Contributor
+- 🎨 Kota Shiva Tarak Reddy — UI Designer & AI Developer
    - Designed the user interface and actively participated in data gathering for training the AI model.
 - 🔧 Solomon Heron — Backend Developer & Data Scientist
    - Handled the backend systems and collaborated in data collection, preprocessing, and labeling.
