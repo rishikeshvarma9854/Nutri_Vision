@@ -20,13 +20,13 @@ import { doc, updateDoc } from 'firebase/firestore';
 import { db } from './firebase/config'; // adjust path as needed
 
 const firebaseConfig = {
-  apiKey: "AIzaSyA6cUdhIJ7vuMrRPJMaVWTWtaIZ7T-0J2U",
-  authDomain: "nutri-vision-704d5.firebaseapp.com",
-  projectId: "nutri-vision-704d5",
-  storageBucket: "nutri-vision-704d5.firebasestorage.app",
-  messagingSenderId: "459313233457",
-  appId: "1:459313233457:web:e8497090f2a65c09c65f10",
-  measurementId: "G-5R7PH6HJ83"
+  apiKey: "your key",
+  authDomain: "your key",
+  projectId: "your key",
+  storageBucket: "your key",
+  messagingSenderId: "your key",
+  appId: "your key",
+  measurementId: "your key"
 };
 
 const app = getApps().length === 0 ? initializeApp(firebaseConfig) : getApps()[0];
@@ -39,7 +39,7 @@ export const requestPermissionAndSaveToken = async (userId) => {
     if (permission === 'granted') {
       const registration = await navigator.serviceWorker.ready;
       const token = await getToken(messaging, {
-        vapidKey: 'BN0iITFIyGKPznLfINBns4uGVaVkifKi_ZIP1CT6UEjKbAkIvaXeMhrdY2CRqsJRzciTTznbqplS-R7W12hrdq8',
+        vapidKey: 'your key',
         serviceWorkerRegistration: registration
       });
       console.log('FCM token:', token);
